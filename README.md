@@ -5,10 +5,10 @@ https://github.com/aws-samples/amazon-transcribe-post-call-analytics/
 ## File Recording Info
 # File Format
 I have the current FreeSWITCH / FusionPBX call recordings setup like this
-record_name=${domain_name}_CUST_${caller_id_number}_GUID_${uuid}_AGENT_${destination_number}_DATETIME_${strftime(%Y)}-${strftime(%m)}-${strftime(%d)}T${strftime(%H)}-${strftime(%M)}-${strftime(%S)}_ROUTE_Follow_.${record_ext}
+<code>record_name=${domain_name}_CUST_${caller_id_number}_GUID_${uuid}_AGENT_${destination_number}_DATETIME_${strftime(%Y)}-${strftime(%m)}-${strftime(%d)}T${strftime(%H)}-${strftime(%M)}-${strftime(%S)}_ROUTE_Follow_.${record_ext}</code>
 
 This creates an mp3 recording with the neccessary info and is for ONLY inbound calls... for outbound calls I utilize this string
-record_name=${domain_name}_CUST_${caller_destination}_GUID_${uuid}_AGENT_${sip_from_user_stripped}_DATETIME_${strftime(%Y)}-${strftime(%m)}-${strftime(%d)}T${strftime(%H)}-${strftime(%M)}-${strftime(%S)}_ROUTE10_.${record_ext}
+<code>record_name=${domain_name}_CUST_${caller_destination}_GUID_${uuid}_AGENT_${sip_from_user_stripped}_DATETIME_${strftime(%Y)}-${strftime(%m)}-${strftime(%d)}T${strftime(%H)}-${strftime(%M)}-${strftime(%S)}_ROUTE10_.${record_ext}</code>
 
 At the end of the file name you can see that I am defining the ROUTE of the call... This helps identify to me a way to figure out where the system started recording this call.
 
