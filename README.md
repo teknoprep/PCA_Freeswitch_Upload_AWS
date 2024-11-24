@@ -3,7 +3,7 @@ This code takes your Freeswitch / FusionPBX call recordings and uploads them to 
 https://github.com/aws-samples/amazon-transcribe-post-call-analytics/
 
 ## File Recording Info
-### File Format<br>
+### File Format
 I have the current FreeSWITCH / FusionPBX call recordings setup like this<br>
 <code>record_name=${domain_name}_CUST_${caller_id_number}_GUID_${uuid}_AGENT_${destination_number}_DATETIME_${strftime(%Y)}-${strftime(%m)}-${strftime(%d)}T${strftime(%H)}-${strftime(%M)}-${strftime(%S)}_ROUTE_Follow_.${record_ext}</code><br>
 
