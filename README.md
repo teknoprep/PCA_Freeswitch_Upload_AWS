@@ -12,6 +12,9 @@ This creates an mp3 recording with the neccessary info and is for ONLY inbound c
 
 At the end of the file name you can see that I am defining the ROUTE of the call... This helps identify to me a way to figure out where the system started recording this call.
 
+Here is an example of a filename that would work well with the PCA defaults
+<code>pbx.example.com_CUST_8005551212_GUID_27d0ae14-f943-4585-b06a-df9ea94ccad6_AGENT_201_DATETIME_2024-11-23T15-57-25_ROUTE10_.mp3</code>
+
 
 # File Location
 We are utilizing the folder format that was setup within FusionPBX for FreeSWITCH... This script does not dynamically change for other systems and would need to be modified
