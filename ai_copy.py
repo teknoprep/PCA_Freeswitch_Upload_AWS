@@ -1,15 +1,3 @@
-
-### **4.2. Explain the Purpose and Usage**
-
-Provide context on why and how to use this feature, helping users understand its importance.
-
----
-
-## **Full Updated Python Script**
-
-For clarity and completeness, here's the **entire updated Python script** incorporating the `AGENT_UPLOAD_FILTER_ARRAY` functionality:
-
-```python
 """
 ========================= Instructions to Build the .env File =========================
 
