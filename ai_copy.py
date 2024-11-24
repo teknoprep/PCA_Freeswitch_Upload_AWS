@@ -1,3 +1,15 @@
+
+### **4.2. Explain the Purpose and Usage**
+
+Provide context on why and how to use this feature, helping users understand its importance.
+
+---
+
+## **Full Updated Python Script**
+
+For clarity and completeness, here's the **entire updated Python script** incorporating the `AGENT_UPLOAD_FILTER_ARRAY` functionality:
+
+```python
 """
 ========================= Instructions to Build the .env File =========================
 
@@ -30,6 +42,9 @@ MIN_FILE_LENGTH_SECONDS=minimum_duration_in_seconds  # e.g., 15
 # Initial Seed Configuration (Optional)
 INITIAL_SEED_DAYS=number_of_days_to_process_on_initial_seed  # e.g., 5
 
+# Agent Upload Filter Array
+AGENT_UPLOAD_FILTER_ARRAY=201,202,212
+
 =======================================================================================
 
 Example .env file:
@@ -47,6 +62,7 @@ RECORD_RETENTION_DAYS=30
 EXTENSIONS_TO_UPLOAD=.wav,.mp3
 MIN_FILE_LENGTH_SECONDS=15
 INITIAL_SEED_DAYS=5
+AGENT_UPLOAD_FILTER_ARRAY=201,202,212
 
 Make sure to replace the example values with your actual configuration.
 
@@ -103,11 +119,26 @@ s3_key_prefix = os.getenv('S3_KEY_PREFIX', '')  # Optional: Set a prefix for S3 
 # AWS Step Functions Configuration
 step_function_arn = os.getenv('STEP_FUNCTION_ARN', 'your_step_function_arn')  # Replace with your Step Function's State Machine ARN
 
+# Agent Upload Filter Configuration
+agent_upload_filter_array_env = os.getenv('AGENT_UPLOAD_FILTER_ARRAY', '')
+if agent_upload_filter_array_env:
+    # Split by commas, strip whitespace, and filter out empty strings
+    agent_upload_filter_array = [agent.strip() for agent in agent_upload_filter_array_env.split(',') if agent.strip()]
+    print(f"Agent upload filter array loaded: {agent_upload_filter_array}")
+else:
+    agent_upload_filter_array = []
+    print("Agent upload filter array is empty. All agent files will be uploaded.")
+
 # -------------------------------------------------------------------
 
 # ------------------------ Duration Checks ------------------------
-from mutagen.mp3 import MP3
-from mutagen.wave import WAVE
+try:
+    from mutagen.mp3 import MP3
+    from mutagen.wave import WAVE
+except ImportError:
+    print("Error: The 'mutagen' library is not installed. Please install it using:")
+    print("pip install mutagen")
+    sys.exit(1)
 
 def get_audio_duration(file_path, extension):
     """
@@ -378,6 +409,24 @@ for date in dates_to_process:
                 corrected_filename = validate_and_fix_ids(original_filename)
                 file_base_name, file_extension = os.path.splitext(corrected_filename)
                 normalized_base_name = normalize_filename(file_base_name)
+
+                # -------------------- Agent Filtering Logic --------------------
+                # Extract _AGENT_ ID from the corrected filename
+                agent_match = re.search(r'_AGENT_(\d+)', corrected_filename)
+                if agent_match:
+                    agent_id = agent_match.group(1)
+                    if agent_upload_filter_array:
+                        if agent_id not in agent_upload_filter_array:
+                            print(f"Skipping file {file_path}: Agent ID {agent_id} is not in the allowed list {agent_upload_filter_array}.")
+                            continue  # Skip this file
+                        else:
+                            print(f"File {file_path} matches allowed Agent ID {agent_id}. Proceeding to upload.")
+                    else:
+                        print(f"Agent upload filter is empty. Proceeding to upload file {file_path} with Agent ID {agent_id}.")
+                else:
+                    print(f"Skipping file {file_path}: No _AGENT_ ID found in filename.")
+                    continue  # Skip files without _AGENT_ ID
+                # -------------------- End Agent Filtering Logic --------------------
 
                 # Flatten the S3 key (filename only)
                 # To prevent collisions, append a unique identifier
