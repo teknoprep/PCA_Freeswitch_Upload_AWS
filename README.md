@@ -6,6 +6,7 @@ This code takes your Freeswitch / FusionPBX call recordings and uploads them to 
 
 
 ### Example .env File
+<code>
 """
 ========================= Instructions to Build the .env File =========================
 
@@ -69,3 +70,4 @@ Note:
 =======================================================================================
 
 """
+</code>
