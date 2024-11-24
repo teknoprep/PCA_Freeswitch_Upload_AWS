@@ -7,7 +7,6 @@ This code takes your Freeswitch / FusionPBX call recordings and uploads them to 
 
 ### Example .env File
 <code>
-"""
 ========================= Instructions to Build the .env File =========================
 
 Create a file named '.env' in the same directory as this script or in a directory accessible by the script.
@@ -68,6 +67,4 @@ Note:
     pip install python-dotenv
 
 =======================================================================================
-
-"""
 </code>
