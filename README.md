@@ -1,5 +1,5 @@
 # PCA_Freeswitch_Upload_AWS
-This code takes your Freeswitch / FusionPBX call recordings and uploads them to S3 for processing utilizing the Post Call Analytics AI analysis which is located on github as well
+This code takes your Freeswitch / FusionPBX call recordings and uploads them to S3 for processing utilizing the Post Call Analytics AI analysis which is located on github as well<br>
 https://github.com/aws-samples/amazon-transcribe-post-call-analytics/
 
 ## File Recording Info
