@@ -8,23 +8,80 @@ Usage examples:
   # fresh run (reads .env), writes plan + uploads, triggers Step Functions
   ./ai_copy_s3.py --domain leemyles.blueuc.com
 
-  # dry run (no uploads / no Step Functions):
+  # dry run (no uploads / no Step Functions)
   ./ai_copy_s3.py --domain leemyles.blueuc.com --dry-run
 
-  # resume from previous state for that domain (ignores .env knobs where applicable):
+  # resume from previous state for that domain (ignores .env knobs where applicable)
   ./ai_copy_s3.py --domain leemyles.blueuc.com --resume
 
-What it does:
-  - Loads config from .env (or env.py fallback) — DB, S3, Step Functions, paths, durations, etc.
-  - Discovers valid agent extensions from DB for the domain.
-  - Scans FreeSWITCH recordings under FREESWITCH_RECORDING_PATH/<domain>/archive/YYYY/Mon/DD
-    for new/changed .wav/.mp3 (AUDIO_EXTS), filters by min seconds.
-  - For each UUID, fetches CDR, finds AGENT (anywhere), finds best CUST (10/11 digits).
-  - Builds exact S3 filename shape:
-      {domain}_CUST_{10/11 digits or UNKNOWN}_GUID_{uuid}_AGENT_{agent or UNKNOWN}_DATETIME_{YYYY-MM-DDTHH-mm-ss}{ext}
-  - Writes a comprehensive rename plan JSON.
-  - Uploads files to S3 (unless --dry-run), records uploads in a state JSON to avoid duplicates.
-  - Triggers AWS Step Functions with a compact payload of this run’s uploads.
+  # test with just ONE file (first eligible never previously one-file-tested)
+  ./ai_copy_s3.py --domain leemyles.blueuc.com --one-file-test
+
+  # scan ONLY an explicit date range (inclusive), ignore resume/seed window
+  ./ai_copy_s3.py --domain leemyles.blueuc.com --date-range 2023-01-01:2023-01-31
+
+  # force uploads to bucket root even if S3_KEY_PREFIX is set / saved
+  ./ai_copy_s3.py --domain leemyles.blueuc.com --no-prefix
+
+───────────────────────────────────────────────────────────────────────────────
+CLI OPTIONS (documented)
+
+  --domain <name>        (required) FusionPBX domain, e.g. leemyles.blueuc.com
+  --dry-run              Do everything except upload to S3 and start Step Functions
+  --resume               Resume using saved state for this domain. This includes
+                        using the saved config snapshot (S3_KEY_PREFIX, etc.).
+  --state <path>         Override state JSON path (default ./out/state_<domain>.json)
+  --plan  <path>         Override rename plan JSON output path
+  --one-file-test        Upload ONLY the first eligible file found this run.
+                        • Skips files already uploaded (in any mode)
+                        • Skips files previously uploaded in one-file-test mode
+                          (tracked in state.one_file_test_history)
+                        • Stops scanning immediately after the first upload
+                          (or the first "would upload" in --dry-run)
+  --date-range A:B       Limit scanning to an explicit inclusive date range where
+                        A and B are YYYY-MM-DD. Example: 2024-01-01:2024-01-31.
+                        Overrides the initial seed window and --resume timing.
+                        When provided, the script DOES NOT update last_run_time_utc
+                        in the state file (so future runs are unaffected).
+  --no-prefix            Ignore S3_KEY_PREFIX from env/saved state and upload to
+                        the bucket root for this run.
+
+───────────────────────────────────────────────────────────────────────────────
+CONFIGURATION (via .env or env.py or environment variables)
+
+  DB_HOST (default 127.0.0.1)
+  DB_PORT (default 5432)
+  DB_NAME (default fusionpbx)
+  DB_USER (default postgres)
+  DB_PASS (default "")
+
+  FREESWITCH_RECORDING_PATH (default /usr/local/freeswitch/recordings)
+  AUDIO_EXTS (default ".wav,.mp3")
+  MIN_FILE_LENGTH_SECONDS (default 15)
+  RECORD_RETENTION_DAYS (default 30)   # prune upload history entries older than this
+  INITIAL_SEED_DAYS (default 5)        # first run scan window when no state exists
+  UUID_REGEX (default RFC-4122-style 36-char regex)
+
+  AGENT_UPLOAD_FILTER_ARRAY (default empty)  # comma-separated allowlist of agent
+                                            # extensions. Empty means allow all.
+
+  S3_BUCKET_NAME (required for uploads)
+  S3_REGION_NAME (default us-east-1)
+  S3_KEY_PREFIX (default empty)  # optional path prefix in the bucket
+
+  STEP_FUNCTION_ARN    (optional)  # if set, triggered when there are uploads
+  STEP_FUNCTION_REGION (default S3_REGION_NAME)
+
+  COMPUTE_MD5 (default False)  # if True, compute and send Content-MD5 on upload
+
+  PLAN_OUT_DIR  (default ./out) # where rename plan JSONs go
+  STATE_OUT_DIR (default ./out) # where state JSONs go
+
+Notes:
+• --resume honors the previously saved config snapshot in state_<domain>.json.
+• --date-range A:B ignores both the initial seed window and resume timing.
+• --no-prefix affects only the current run and is NOT saved to state.
+• Deterministic scanning order: dates ascending, folders ascending, files ascending.
 """
 
 import os
@@ -34,6 +91,7 @@ import json
 import time
 import hashlib
 import argparse
+import base64
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, date, timedelta, timezone
 from decimal import Decimal
@@ -423,6 +481,17 @@ def get_audio_duration(file_path: str) -> float:
     return 0.0
 
 # -------------------- CLI --------------------
+
+def parse_date_range(s: str) -> Tuple[date, date]:
+    m = re.match(r"^\s*(\d{4}-\d{2}-\d{2})\s*:\s*(\d{4}-\d{2}-\d{2})\s*$", s)
+    if not m:
+        raise ValueError("--date-range must be in the form YYYY-MM-DD:YYYY-MM-DD")
+    start = date.fromisoformat(m.group(1))
+    end = date.fromisoformat(m.group(2))
+    if end < start:
+        start, end = end, start
+    return start, end
+
 def parse_args():
     ap = argparse.ArgumentParser(description="End-to-end: scan → rename plan → S3 upload → Step Functions")
     ap.add_argument("--domain", required=True, help="PBX domain, e.g. leemyles.blueuc.com")
@@ -430,9 +499,13 @@ def parse_args():
     ap.add_argument("--resume", action="store_true", help="Resume using saved state for this domain")
     ap.add_argument("--state", help="Path to state JSON (default ./out/state_<domain>.json)")
     ap.add_argument("--plan", help="Path to write rename plan JSON (default ./out/rename_plan_<domain>.json)")
+    ap.add_argument("--one-file-test", action="store_true", help="Upload only the first eligible file not previously used for one-file tests; stop immediately after")
+    ap.add_argument("--date-range", help="YYYY-MM-DD:YYYY-MM-DD inclusive; scan only this range; ignore resume/seed timing; does not update last_run_time_utc")
+    ap.add_argument("--no-prefix", action="store_true", help="Ignore S3_KEY_PREFIX and upload to bucket root")
     return ap.parse_args()
 
 # -------------------- State I/O --------------------
+
 def default_state_path(domain: str) -> str:
     os.makedirs(STATE_OUT_DIR, exist_ok=True)
     return os.path.join(STATE_OUT_DIR, f"state_{domain}.json")
@@ -457,6 +530,7 @@ def save_state(path: str, state: Dict[str, Any]):
         json.dump(data, f, indent=2)
 
 # -------------------- Main --------------------
+
 def main():
     args = parse_args()
     domain = args.domain.strip()
@@ -466,6 +540,8 @@ def main():
 
     # Load or init state
     state = load_state(state_path)
+    if "one_file_test_history" not in state:
+        state["one_file_test_history"] = []  # absolute paths uploaded during --one-file-test
 
     # Effective config (resume prefers saved config snapshot)
     cfg = {
@@ -502,20 +578,30 @@ def main():
         print(f"[INFO] pruned {len(to_del)} old upload entries older than {cfg['RECORD_RETENTION_DAYS']} days")
 
     # Determine time window
-    last_run = None
-    if "last_run_time_utc" in state:
+    should_update_last_run = True
+    if args.date_range:
         try:
-            last_run = datetime.fromisoformat(state["last_run_time_utc"].replace("Z",""))
-        except Exception:
-            last_run = None
-
-    if last_run is None:
-        print(f"[INFO] First run or no valid last run time. Initial seed window: {cfg['INITIAL_SEED_DAYS']} day(s).")
-        start_date = (datetime.now(timezone.utc) - timedelta(days=int(cfg["INITIAL_SEED_DAYS"]))).date()
+            start_date, end_date = parse_date_range(args.date_range)
+        except Exception as e:
+            print(f"[ERROR] {e}")
+            sys.exit(2)
+        print(f"[INFO] Using explicit date range {start_date} to {end_date} (inclusive). Ignoring --resume/seed timing.")
+        should_update_last_run = False
     else:
-        print(f"[INFO] Resuming since last run at {state['last_run_time_utc']}")
-        start_date = last_run.date()
-    end_date = datetime.now(timezone.utc).date()
+        last_run = None
+        if "last_run_time_utc" in state:
+            try:
+                last_run = datetime.fromisoformat(state["last_run_time_utc"].replace("Z",""))
+            except Exception:
+                last_run = None
+
+        if last_run is None:
+            print(f"[INFO] First run or no valid last run time. Initial seed window: {cfg['INITIAL_SEED_DAYS']} day(s).")
+            start_date = (datetime.now(timezone.utc) - timedelta(days=int(cfg["INITIAL_SEED_DAYS"]))).date()
+        else:
+            print(f"[INFO] Resuming since last run at {state['last_run_time_utc']}")
+            start_date = last_run.date()
+        end_date = datetime.now(timezone.utc).date()
 
     # DB connect & prep
     print(f"[INFO] Connecting DB {DB_HOST}:{DB_PORT}/{DB_NAME} as {DB_USER} ...")
@@ -525,7 +611,7 @@ def main():
     domain_uuid = resolve_domain_uuid(cur, domain)
     if not domain_uuid:
         print(f"[ERROR] Could not resolve domain_uuid for domain={domain}")
-        sys.exit(2)
+        sys.exit(3)
 
     valid_ext_list = fetch_valid_extensions(cur, domain_uuid)
     valid_exts = set(valid_ext_list)
@@ -539,7 +625,7 @@ def main():
     root_domain_dir = os.path.join(cfg["FREESWITCH_RECORDING_PATH"], domain, "archive")
     if not os.path.isdir(root_domain_dir):
         print(f"[ERROR] Missing domain archive directory: {root_domain_dir}")
-        sys.exit(3)
+        sys.exit(4)
 
     # Stats + plan items
     items: List[Dict[str, Any]] = []
@@ -558,7 +644,7 @@ def main():
         "strategy_counts": {"uuid_col": 0, "fallback_like": 0, "not_found": 0}
     }
 
-    # Build date list inclusive
+    # Build date list inclusive (ascending, deterministic)
     dates: List[date] = []
     d = start_date
     while d <= end_date:
@@ -572,8 +658,13 @@ def main():
     # UUID filename regex
     uuid_re = re.compile(UUID_REGEX)
 
+    # Control for one-file-test early stop
+    stop_scanning = False
+
     # Iterate day folders
     for day_date in dates:
+        if stop_scanning:
+            break
         year_str = f"{day_date.year:04d}"
         month_str = month_names[day_date.month - 1]
         day_str = f"{day_date.day:02d}"
@@ -583,8 +674,12 @@ def main():
             continue
 
         print(f"[SCAN] {folder}")
-        for root, _, files in os.walk(folder):
+        for root, dirs, files in os.walk(folder):
+            dirs.sort()
+            files.sort()
             for fn in files:
+                if stop_scanning:
+                    break
                 ext = os.path.splitext(fn)[1].lower()
                 if ext not in cfg["AUDIO_EXTS"]:
                     continue
@@ -605,6 +700,14 @@ def main():
                 if duration < float(cfg["MIN_FILE_LENGTH_SECONDS"]):
                     continue
                 stats["files_duration_ok"] += 1
+
+                # Skip if this file was already one-file-tested or uploaded before
+                if args.one_file_test:
+                    if abs_path in state.get("one_file_test_history", []):
+                        continue
+                    if abs_path in uploaded_files:
+                        # already uploaded in a prior run
+                        continue
 
                 # CDR fetch
                 sql, params, cdr_row, strategy = fetch_cdr_by_uuid(cur, uuid, cols_present, uuid_col)
@@ -761,7 +864,8 @@ def main():
 
                 # ---- Upload or skip based on state (path + size)
                 # Flatten S3 key (keep prefix if configured)
-                s3_key = s3_name if not S3_KEY_PREFIX else f"{S3_KEY_PREFIX.rstrip('/')}/{s3_name}"
+                prefix = "" if args.no_prefix else (cfg["S3_KEY_PREFIX"] or "")
+                s3_key = s3_name if not prefix else f"{prefix.rstrip('/')}/{s3_name}"
 
                 # Upload dedupe key = absolute path
                 k = entry["original"]["absolute_path"]
@@ -769,22 +873,27 @@ def main():
                 prev = uploaded_files.get(k)
                 unchanged = bool(prev and int(prev.get("file_size", -1)) == int(sz_now))
 
+                did_upload = False
+                would_upload = False
+
                 if unchanged:
                     stats["uploads_skipped_unchanged"] += 1
                 else:
                     if dry_run:
                         print(f"[DRY-RUN] Would upload -> s3://{S3_BUCKET_NAME}/{s3_key}")
+                        would_upload = True
                     else:
                         if not S3_BUCKET_NAME:
                             print("[ERROR] S3_BUCKET_NAME not set. Aborting uploads.")
-                            cur.close(); conn.close(); sys.exit(4)
+                            cur.close(); conn.close(); sys.exit(5)
                         extra = {}
                         if COMPUTE_MD5:
                             hexd = md5_of_file(k)
-                            extra["ContentMD5"] = hashlib.base64.b64encode(bytes.fromhex(hexd)).decode("ascii") if hasattr(hashlib, "base64") else None
+                            extra["ContentMD5"] = base64.b64encode(bytes.fromhex(hexd)).decode("ascii")
                         s3 = s3_client(S3_REGION_NAME)
-                        s3.upload_file(k, S3_BUCKET_NAME, s3_key, ExtraArgs={k:v for k,v in extra.items() if v})
+                        s3.upload_file(k, S3_BUCKET_NAME, s3_key, ExtraArgs={kv:vv for kv,vv in extra.items() if vv})
                         stats["uploads_done"] += 1
+                        did_upload = True
                         # Track in state
                         uploaded_files[k] = {
                             "uploaded_at": datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),
@@ -804,6 +913,16 @@ def main():
                         })
 
                 items.append(entry)
+
+                # Early-stop logic for --one-file-test
+                if args.one_file_test and (did_upload or would_upload):
+                    if did_upload:
+                        # only record history on actual upload
+                        state["one_file_test_history"].append(k)
+                    stop_scanning = True
+
+        # end os.walk
+    # end day loop
 
     # Done DB
     cur.close()
@@ -825,7 +944,8 @@ def main():
     print(f"[INFO] Wrote rename plan -> {plan_path}")
 
     # Update & save state
-    state["last_run_time_utc"] = datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
+    if should_update_last_run:
+        state["last_run_time_utc"] = datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
     state["config_snapshot"] = cfg
     state["uploaded_files"] = uploaded_files
     state["last_plan"] = {"path": os.path.abspath(plan_path), "run": run_meta, "stats": stats}
