@@ -578,7 +578,7 @@ def main():
         print(f"[INFO] pruned {len(to_del)} old upload entries older than {cfg['RECORD_RETENTION_DAYS']} days")
 
     # Determine time window
-    should_update_last_run = True
+    should_update_last_run = not (args.date_range or args.one_file_test)
     if args.date_range:
         try:
             start_date, end_date = parse_date_range(args.date_range)
@@ -586,7 +586,10 @@ def main():
             print(f"[ERROR] {e}")
             sys.exit(2)
         print(f"[INFO] Using explicit date range {start_date} to {end_date} (inclusive). Ignoring --resume/seed timing.")
-        should_update_last_run = False
+    elif args.one_file_test:
+        start_date = (datetime.now(timezone.utc) - timedelta(days=int(cfg["INITIAL_SEED_DAYS"])) ).date()
+        end_date = datetime.now(timezone.utc).date()
+        print(f"[INFO] --one-file-test: scanning last {cfg['INITIAL_SEED_DAYS']} day(s); ignoring --resume timing.")
     else:
         last_run = None
         if "last_run_time_utc" in state:
@@ -597,7 +600,7 @@ def main():
 
         if last_run is None:
             print(f"[INFO] First run or no valid last run time. Initial seed window: {cfg['INITIAL_SEED_DAYS']} day(s).")
-            start_date = (datetime.now(timezone.utc) - timedelta(days=int(cfg["INITIAL_SEED_DAYS"]))).date()
+            start_date = (datetime.now(timezone.utc) - timedelta(days=int(cfg["INITIAL_SEED_DAYS"])) ).date()
         else:
             print(f"[INFO] Resuming since last run at {state['last_run_time_utc']}")
             start_date = last_run.date()
@@ -862,55 +865,58 @@ def main():
                 entry["status"] = "ok"
                 stats["mapped_agent_cust"] += 1
 
-                # ---- Upload or skip based on state (path + size)
+                # ---- Upload or skip based on state (never re-upload same absolute path)
                 # Flatten S3 key (keep prefix if configured)
                 prefix = "" if args.no_prefix else (cfg["S3_KEY_PREFIX"] or "")
                 s3_key = s3_name if not prefix else f"{prefix.rstrip('/')}/{s3_name}"
 
-                # Upload dedupe key = absolute path
+                # Dedupe by absolute path across ALL modes
                 k = entry["original"]["absolute_path"]
-                sz_now = entry["original"]["bytes"]
                 prev = uploaded_files.get(k)
-                unchanged = bool(prev and int(prev.get("file_size", -1)) == int(sz_now))
+                if prev:
+                    entry["status"] = "already_uploaded"
+                    entry["reason"] = "File previously uploaded (dedupe by absolute path)."
+                    stats["uploads_skipped_unchanged"] += 1  # reuse counter to avoid breaking consumers
+                    items.append(entry)
+                    # Don't stop scanning here; keep looking for the next eligible file
+                    continue
 
+                sz_now = entry["original"]["bytes"]
                 did_upload = False
                 would_upload = False
 
-                if unchanged:
-                    stats["uploads_skipped_unchanged"] += 1
+                if dry_run:
+                    print(f"[DRY-RUN] Would upload -> s3://{S3_BUCKET_NAME}/{s3_key}")
+                    would_upload = True
                 else:
-                    if dry_run:
-                        print(f"[DRY-RUN] Would upload -> s3://{S3_BUCKET_NAME}/{s3_key}")
-                        would_upload = True
-                    else:
-                        if not S3_BUCKET_NAME:
-                            print("[ERROR] S3_BUCKET_NAME not set. Aborting uploads.")
-                            cur.close(); conn.close(); sys.exit(5)
-                        extra = {}
-                        if COMPUTE_MD5:
-                            hexd = md5_of_file(k)
-                            extra["ContentMD5"] = base64.b64encode(bytes.fromhex(hexd)).decode("ascii")
-                        s3 = s3_client(S3_REGION_NAME)
-                        s3.upload_file(k, S3_BUCKET_NAME, s3_key, ExtraArgs={kv:vv for kv,vv in extra.items() if vv})
-                        stats["uploads_done"] += 1
-                        did_upload = True
-                        # Track in state
-                        uploaded_files[k] = {
-                            "uploaded_at": datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),
-                            "file_size": int(sz_now),
-                            "s3_bucket": S3_BUCKET_NAME,
-                            "s3_key": s3_key,
-                            "uuid": uuid
-                        }
-                        uploaded_this_run.append({
-                            "uuid": uuid,
-                            "local_path": k,
-                            "s3_bucket": S3_BUCKET_NAME,
-                            "s3_key": s3_key,
-                            "agent": agent_ext or "UNKNOWN",
-                            "cust": cust_digits or "UNKNOWN",
-                            "datetime": proposed["s3_components"]["datetime_iso"],
-                        })
+                    if not S3_BUCKET_NAME:
+                        print("[ERROR] S3_BUCKET_NAME not set. Aborting uploads.")
+                        cur.close(); conn.close(); sys.exit(5)
+                    extra = {}
+                    if COMPUTE_MD5:
+                        hexd = md5_of_file(k)
+                        extra["ContentMD5"] = base64.b64encode(bytes.fromhex(hexd)).decode("ascii")
+                    s3 = s3_client(S3_REGION_NAME)
+                    s3.upload_file(k, S3_BUCKET_NAME, s3_key, ExtraArgs={kv: vv for kv, vv in extra.items() if vv})
+                    stats["uploads_done"] += 1
+                    did_upload = True
+                    # Track in state (path-based dedupe)
+                    uploaded_files[k] = {
+                        "uploaded_at": datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),
+                        "file_size": int(sz_now),
+                        "s3_bucket": S3_BUCKET_NAME,
+                        "s3_key": s3_key,
+                        "uuid": uuid
+                    }
+                    uploaded_this_run.append({
+                        "uuid": uuid,
+                        "local_path": k,
+                        "s3_bucket": S3_BUCKET_NAME,
+                        "s3_key": s3_key,
+                        "agent": agent_ext or "UNKNOWN",
+                        "cust": cust_digits or "UNKNOWN",
+                        "datetime": proposed["s3_components"]["datetime_iso"],
+                    })
 
                 items.append(entry)
 
@@ -985,7 +991,8 @@ def main():
             print("[INFO] No new uploads this run; Step Functions not triggered.")
 
     # Summary
-    print("\n===== SUMMARY =====")
+    print("
+===== SUMMARY =====")
     print(json.dumps(make_json_safe(stats), indent=2))
     printable = sum(1 for it in items if it.get("status") == "ok")
     print(f"Files with a valid AGENT/CUST mapping (would be renamed): {printable}")
