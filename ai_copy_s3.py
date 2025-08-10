@@ -571,7 +571,7 @@ def main():
     # Retention pruning (by uploaded_at)
     cutoff = datetime.now(timezone.utc) - timedelta(days=int(cfg["RECORD_RETENTION_DAYS"]))
     to_del = [k for k, v in uploaded_files.items()
-              if "uploaded_at" in v and datetime.fromisoformat(v["uploaded_at"].replace("Z","")) < cutoff]
+              if "uploaded_at" in v and datetime.fromisoformat(v["uploaded_at"].replace("Z","+00:00")) < cutoff]
     for k in to_del:
         uploaded_files.pop(k, None)
     if to_del:
@@ -591,7 +591,7 @@ def main():
         last_run = None
         if "last_run_time_utc" in state:
             try:
-                last_run = datetime.fromisoformat(state["last_run_time_utc"].replace("Z",""))
+                last_run = datetime.fromisoformat(state["last_run_time_utc"].replace("Z","+00:00"))
             except Exception:
                 last_run = None
 
