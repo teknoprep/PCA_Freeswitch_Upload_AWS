@@ -389,6 +389,184 @@ def find_agent_anywhere(cdr: Dict[str, Any], valid_exts: set) -> Tuple[Optional[
             return ext, hits, source_field
     return None, [], ""
 
+def is_uuidish(val: Optional[str]) -> bool:
+    try:
+        s = str(val or "").strip()
+        if not s:
+            return False
+        return re.fullmatch(UUID_REGEX, s) is not None
+    except Exception:
+        return False
+def collect_extension_hits(cdr: Dict[str, Any], valid_exts: set) -> Dict[str, List[str]]:
+    hits: Dict[str, set] = {}
+    for k, v in cdr.items():
+        if v is None:
+            continue
+        s = str(v)
+        if not s:
+            continue
+        field_hits = set()
+        for ext in valid_exts:
+            pat = re.compile(rf"(?<!\d){re.escape(ext)}(?!\d)")
+            if pat.search(s):
+                field_hits.add(ext)
+        if field_hits:
+            hits[k] = field_hits
+    return {k: sorted(list(v), key=lambda x: (len(x), x)) for k, v in hits.items()}
+  
+def fetch_related_cdr_rows(cur,
+                           seed_row: Dict[str, Any],
+                           cols_present: set,
+                           uuid_col: Optional[str]) -> List[Dict[str, Any]]:
+    """
+    Given one CDR row, collect likely-related rows by chasing bridge UUIDs.
+    Returns a list of DISTINCT rows including the seed.
+    """
+    related: List[Dict[str, Any]] = []
+    seen_keys: set = set()
+
+    def add_row(r: Dict[str, Any]):
+        # Build a stable identity key from available UUID-like columns so we don't duplicate
+        key_vals = []
+        for c in ("xml_cdr_uuid", "uuid", "call_uuid", "bridge_uuid", "bleg_uuid", "variable_bridge_id"):
+            if c in r and r.get(c):
+                key_vals.append(str(r.get(c)))
+        key = "|".join(key_vals) or str(id(r))
+        if key not in seen_keys:
+            related.append(r)
+            seen_keys.add(key)
+
+    # Always include the seed
+    add_row(seed_row)
+
+    # Collect candidate bridged UUIDs from the seed
+    bridge_keys = []
+    for k in ("bridge_uuid", "bleg_uuid", "variable_bridge_id"):
+        v = seed_row.get(k)
+        if is_uuidish(v):
+            bridge_keys.append((k, str(v)))
+
+    if not bridge_keys:
+        return related
+
+    # Build SELECT for the same subset we already use
+    select_clause = make_select_clause(cols_present)
+
+    # For each bridged UUID, try to fetch a row directly via the configured uuid column,
+    # and also try each of the common CDR uuid-ish columns.
+    for _, buid in bridge_keys:
+        found = False
+        for cand in ["xml_cdr_uuid", "uuid", "call_uuid", "bridge_uuid", "bleg_uuid", "variable_bridge_id"]:
+            if cand not in cols_present:
+                continue
+            sql = f"SELECT {select_clause} FROM v_xml_cdr WHERE {cand} = %s ORDER BY start_stamp DESC NULLS LAST LIMIT 1"
+            cur.execute(sql, (buid,))
+            r = cur.fetchone()
+            if r:
+                add_row(r)
+                found = True
+                break
+
+        # Last ditch: look for filename match if columns exist
+        if not found:
+            like_cols = [c for c in ("record_name", "record_path") if c in cols_present]
+            if like_cols:
+                conds = " OR ".join([f"{c} ILIKE %s" for c in like_cols])
+                sql = f"SELECT {select_clause} FROM v_xml_cdr WHERE {conds} ORDER BY start_stamp DESC NULLS LAST LIMIT 1"
+                needle = f"%{buid}%"
+                params = tuple(needle for _ in like_cols)
+                cur.execute(sql, params)
+                r = cur.fetchone()
+                if r:
+                    add_row(r)
+
+    return related
+
+def pick_answered_agent_from_rows(rows: List[Dict[str, Any]],
+                                  valid_exts: set) -> Tuple[Optional[str], str, Dict[str, Any]]:
+    """
+    From a set of related rows (a/b legs), choose the answered leg and extract the agent extension.
+    Returns (agent_ext, source_field, chosen_row). Prints detailed DEBUG lines.
+    """
+    # 1) Prefer rows that were actually answered and had talk time
+    def answered_key(r: Dict[str, Any]) -> Tuple[int, int]:
+        bill = int(r.get("billsec") or 0)
+        ans_present = 1 if r.get("answer_stamp") else 0
+        return (ans_present, 1 if bill > 0 else 0)
+
+    # Highest score first
+    rows_sorted = sorted(rows, key=answered_key, reverse=True)
+
+    # 2) For each candidate, try strong signals first
+    for idx, r in enumerate(rows_sorted, 1):
+        direction = str(r.get("direction") or "").lower()
+        cid = str(r.get("caller_id_number") or "")
+        dst = str(r.get("destination_number") or "")
+        print(f"[DEBUG] CANDIDATE LEG #{idx}  direction={direction}  billsec={r.get('billsec')}  answer_stamp={r.get('answer_stamp')}  cid={cid}  dst={dst}")
+
+        # field-by-field hits (debug)
+        hits = collect_extension_hits(r, valid_exts)
+        if hits:
+            print("[DEBUG]   extension hits per field:")
+            preferred = [
+                "presence_id", "variable_sip_to_user", "variable_sip_from_user",
+                "destination_number", "caller_id_number",
+                "caller_destination", "last_arg", "context", "user_context",
+                "variables", "json", "raw_json", "call_json"
+            ]
+            printed = set()
+            for f in preferred:
+                if f in hits:
+                    print(f"    - {f}: {', '.join(hits[f])}")
+                    printed.add(f)
+            for f in sorted(hits.keys()):
+                if f not in printed:
+                    print(f"    - {f}: {', '.join(hits[f])}")
+        else:
+            print("[DEBUG]   no single-field hits")
+
+        # try presence_id first (EXT@domain)
+        pres = str(r.get("presence_id") or "")
+        if "@" in pres:
+            ext = pres.split("@", 1)[0]
+            if ext in valid_exts:
+                print(f"[DEBUG]   picked agent via presence_id: {ext}")
+                return ext, "presence_id", r
+
+        # direction-aware SIP users
+        to_user = str(r.get("variable_sip_to_user") or "")
+        from_user = str(r.get("variable_sip_from_user") or "")
+        if direction == "inbound":
+            if to_user in valid_exts:
+                print(f"[DEBUG]   picked agent via variable_sip_to_user (inbound): {to_user}")
+                return to_user, "variable_sip_to_user", r
+            if dst in valid_exts:
+                print(f"[DEBUG]   picked agent via destination_number (inbound): {dst}")
+                return dst, "destination_number", r
+        elif direction == "outbound":
+            if from_user in valid_exts:
+                print(f"[DEBUG]   picked agent via variable_sip_from_user (outbound): {from_user}")
+                return from_user, "variable_sip_from_user", r
+            if cid in valid_exts:
+                print(f"[DEBUG]   picked agent via caller_id_number (outbound): {cid}")
+                return cid, "caller_id_number", r
+
+        # direction unknown or none of the above — generic fallbacks
+        for f in ("variable_sip_to_user", "variable_sip_from_user", "destination_number", "caller_id_number"):
+            v = str(r.get(f) or "")
+            if v in valid_exts:
+                print(f"[DEBUG]   picked agent via {f}: {v}")
+                return v, f, r
+
+        # Nothing from this row; continue to the next candidate
+        print("[DEBUG]   did not identify agent on this leg; trying next")
+
+    # Nothing matched at all
+    print("[DEBUG] No agent extension matched on any related rows.")
+    return None, "", rows_sorted[0] if rows_sorted else ({},)
+
+
+
 def prefer_external_number(caller_id_number: Optional[str], destination_number: Optional[str], agent_ext: Optional[str]) -> Tuple[str, str]:
     cid = digits_only(caller_id_number)
     dst = digits_only(destination_number)
@@ -783,45 +961,45 @@ def main():
                         cdr_out[k] = v
                 entry["cdr"] = cdr_out
 
-                # Agent detection
-                agent_ext, hits, agent_src = find_agent_anywhere(cdr_row, valid_exts)
-                decision_rule = ""
-                decision_note = ""
-                if agent_ext:
-                    decision_rule = "agent_found_anywhere_in_cdr"
-                    decision_note = f"Matched extension {agent_ext} (source field: {agent_src})."
+                                # -------------------- Agent detection (answered leg logic) --------------------
+                # Show quick context about the a-leg row we fetched by filename/UUID
+                print("\n[DEBUG] v_xml_cdr lookup strategy:", strategy)
+                print("[DEBUG] Table: v_xml_cdr (seed a-leg) | UUID:", uuid)
+                print("[DEBUG] Direction:", cdr_row.get("direction"),
+                      "| caller_id_number:", cdr_row.get("caller_id_number"),
+                      "| destination_number:", cdr_row.get("destination_number"))
+
+                # Pull any related rows (b-leg etc.) and choose the answered leg
+                related_rows = fetch_related_cdr_rows(cur, cdr_row, cols_present, uuid_col)
+                if len(related_rows) > 1:
+                    print(f"[DEBUG] Found {len(related_rows)} related CDR row(s) including seed (a/b legs).")
                 else:
-                    # try direct caller/destination equality
-                    valid_set = set(valid_exts)
-                    cid = str(cdr_row.get("caller_id_number") or "")
-                    dst = str(cdr_row.get("destination_number") or "")
-                    cid_in = cid in valid_set
-                    dst_in = dst in valid_set
-                    if cid_in and not dst_in:
-                        agent_ext = cid; agent_src = "caller_id_number"
-                        decision_rule = "caller_is_agent"
-                        decision_note = "caller_id_number matched a valid extension"
-                    elif dst_in and not cid_in:
-                        agent_ext = dst; agent_src = "destination_number"
-                        decision_rule = "destination_is_agent"
-                        decision_note = "destination_number matched a valid extension"
-                    elif cid_in and dst_in:
-                        agent_ext = dst; agent_src = "destination_number"
-                        decision_rule = "both_in_ext_choose_destination"
-                        decision_note = "both matched; chose destination as agent"
-                    else:
-                        entry["decision"] = {
-                            "rule": "no_agent_match",
-                            "note": "no extension found anywhere in CDR",
-                            "agent": None,
-                            "cust": None,
-                            "match_locations": hits
-                        }
-                        entry["status"] = "no_agent_match"
-                        entry["reason"] = "no extension found anywhere in CDR"
-                        stats["no_agent_match"] += 1
-                        items.append(entry)
-                        continue
+                    print("[DEBUG] No additional related rows (no bridge UUIDs present).")
+
+                agent_ext, agent_src_field, chosen_row = pick_answered_agent_from_rows(related_rows, valid_exts)
+
+                if not agent_ext:
+                    entry["decision"] = {
+                        "rule": "no_agent_match",
+                        "note": "no extension found on answered leg(s)",
+                        "agent": None,
+                        "cust": None,
+                        "match_locations": []
+                    }
+                    entry["status"] = "no_agent_match"
+                    entry["reason"] = "no extension found on answered leg(s)"
+                    stats["no_agent_match"] += 1
+                    print("[DEBUG] AGENT: <none> (no_agent_match)")
+                    items.append(entry)
+                    continue
+
+                # Finalize agent decision
+                decision_rule = "answered_leg_agent"
+                decision_note = f"Picked answered leg; extension via {agent_src_field}"
+                agent_src = agent_src_field
+                print(f"[DEBUG] AGENT CHOSEN: {agent_ext}  (via {agent_src_field})")
+                # -------------------------------------------------------------------------------
+
 
                 # CUST detection
                 cust_digits, cust_source_field = find_cust_digits_anywhere(cdr_row, agent_ext, valid_exts)
