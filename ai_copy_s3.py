@@ -461,6 +461,29 @@ def resolve_agent_extension(cdr: Dict[str, Any], valid_exts: set) -> Tuple[Optio
 
     return None, "", []
 
+def collect_extension_hits(cdr: Dict[str, Any], valid_exts: set) -> Dict[str, List[str]]:
+    """
+    Return a dict: field_name -> sorted unique list of valid extensions that appear in that field's value.
+    Uses digit-boundary regex so '103' doesn't match '1030'.
+    """
+    hits: Dict[str, set] = {}
+    # We’ll scan every string-like field in the row
+    for k, v in cdr.items():
+        if v is None:
+            continue
+        s = str(v)
+        if not s:
+            continue
+        field_hits = set()
+        for ext in valid_exts:
+            pat = re.compile(rf"(?<!\d){re.escape(ext)}(?!\d)")
+            if pat.search(s):
+                field_hits.add(ext)
+        if field_hits:
+            hits[k] = field_hits
+    # Convert sets to sorted lists for readability
+    return {k: sorted(list(v), key=lambda x: (len(x), x)) for k, v in hits.items()}
+
 
 def prefer_external_number(caller_id_number: Optional[str], destination_number: Optional[str], agent_ext: Optional[str]) -> Tuple[str, str]:
     cid = digits_only(caller_id_number)
@@ -856,6 +879,34 @@ def main():
                         cdr_out[k] = v
                 entry["cdr"] = cdr_out
 
+                # -------------------- DEBUG: print where extensions appear --------------------
+                ext_hits = collect_extension_hits(cdr_row, valid_exts)
+                print("\n[DEBUG] v_xml_cdr lookup strategy:", strategy)
+                print("[DEBUG] Table: v_xml_cdr  |  UUID:", uuid)
+                print("[DEBUG] Direction:", cdr_row.get("direction"),
+                      "| caller_id_number:", cdr_row.get("caller_id_number"),
+                      "| destination_number:", cdr_row.get("destination_number"))
+                if ext_hits:
+                    print("[DEBUG] Extension hits per field (valid_exts only):")
+                    # Print stable order: prioritize common fields, then others
+                    priority = [
+                        "presence_id","variable_sip_to_user","variable_sip_from_user",
+                        "destination_number","caller_id_number",
+                        "caller_destination","last_arg","context","user_context",
+                        "variables","json","raw_json","call_json"
+                    ]
+                    printed = set()
+                    for fld in priority:
+                        if fld in ext_hits:
+                            print(f"  - {fld}: {', '.join(ext_hits[fld])}")
+                            printed.add(fld)
+                    for fld in sorted(ext_hits.keys()):
+                        if fld not in printed:
+                            print(f"  - {fld}: {', '.join(ext_hits[fld])}")
+                else:
+                    print("[DEBUG] No valid extension strings found in any single CDR field.")
+                # ---------------------------------------------------------------------------
+
                 # -------------------- NEW agent detection (priority resolver) --------------------
                 agent_ext, agent_src, hits = resolve_agent_extension(cdr_row, valid_exts)
                 if not agent_ext:
@@ -869,11 +920,13 @@ def main():
                     entry["status"] = "no_agent_match"
                     entry["reason"] = "no extension found"
                     stats["no_agent_match"] += 1
+                    print("[DEBUG] AGENT: <none> (no_agent_match)")
                     items.append(entry)
                     continue
 
                 decision_rule = "agent_resolver_priority"
                 decision_note = f"Selected {agent_ext} via {agent_src}"
+                print(f"[DEBUG] AGENT CHOSEN: {agent_ext}  (via {agent_src})")
                 # -------------------------------------------------------------------------------
 
                 # CUST detection
@@ -908,6 +961,13 @@ def main():
                     "new_absolute_path": os.path.join(os.path.dirname(entry["original"]["absolute_path"]), f"{cust_digits or 'UNKNOWN'}-{agent_ext or 'UNKNOWN'}-{uuid}{ext}")
                 }
 
+                # -------------------- DEBUG: filename changes --------------------
+                print(f"[DEBUG] FILENAME: original_basename='{fn}'  |  new_basename='{proposed['new_basename']}'")
+                prefix = "" if args.no_prefix else (cfg["S3_KEY_PREFIX"] or "")
+                s3_key_preview = s3_name if not prefix else f"{prefix.rstrip('/')}/{s3_name}"
+                print(f"[DEBUG] S3 KEY: {s3_key_preview}")
+                # ---------------------------------------------------------------
+
                 # Allow agent filter (optional)
                 if AGENT_UPLOAD_FILTER_ARRAY and agent_ext not in AGENT_UPLOAD_FILTER_ARRAY:
                     entry["decision"] = {
@@ -938,7 +998,6 @@ def main():
                 stats["mapped_agent_cust"] += 1
 
                 # ---- Upload or skip based on state (never re-upload same absolute path)
-                # Flatten S3 key (keep prefix if configured)
                 prefix = "" if args.no_prefix else (cfg["S3_KEY_PREFIX"] or "")
                 s3_key = s3_name if not prefix else f"{prefix.rstrip('/')}/{s3_name}"
 
@@ -1064,6 +1123,7 @@ def main():
     print(json.dumps(make_json_safe(stats), indent=2))
     printable = sum(1 for it in items if it.get("status") == "ok")
     print(f"Files with a valid AGENT/CUST mapping (would be renamed): {printable}")
+
 
 
 if __name__ == "__main__":
