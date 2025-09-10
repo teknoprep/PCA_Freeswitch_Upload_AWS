@@ -390,6 +390,60 @@ def find_agent_anywhere(cdr: Dict[str, Any], valid_exts: set) -> Tuple[Optional[
             return ext, hits, source_field
     return None, [], ""
 
+def fast_pick_agent_from_seed_row(cdr_row: Dict[str, Any], valid_exts: set) -> Tuple[Optional[str], str]:
+    """
+    SUPER-FAST decision using only the seed row (the one we found by UUID).
+    Priority mirrors what the CDR UI typically surfaces:
+
+    1) presence_id -> EXT@domain  (EXT must be a valid extension)
+    2) Direction-aware SIP users and numbers:
+       - inbound/local:  variable_sip_to_user, destination_number
+       - outbound/local: variable_sip_from_user, caller_id_number
+    3) Fallbacks: variable_sip_to_user, variable_sip_from_user, destination_number, caller_id_number
+    """
+    direction = str(cdr_row.get("direction") or "").lower()
+    presence_id = str(cdr_row.get("presence_id") or "")
+    sip_to = str(cdr_row.get("variable_sip_to_user") or "")
+    sip_from = str(cdr_row.get("variable_sip_from_user") or "")
+    cid = str(cdr_row.get("caller_id_number") or "")
+    dst = str(cdr_row.get("destination_number") or "")
+
+    # presence_id like "103@domain"
+    if "@" in presence_id:
+        ext = presence_id.split("@", 1)[0]
+        if ext in valid_exts:
+            print(f"[DEBUG] FAST: picked agent via presence_id: {ext}")
+            return ext, "presence_id"
+
+    # Direction-aware picks
+    if direction in ("inbound", "local"):
+        if sip_to in valid_exts:
+            print(f"[DEBUG] FAST: picked agent via variable_sip_to_user (inbound/local): {sip_to}")
+            return sip_to, "variable_sip_to_user"
+        if dst in valid_exts:
+            print(f"[DEBUG] FAST: picked agent via destination_number (inbound/local): {dst}")
+            return dst, "destination_number"
+
+    if direction in ("outbound", "local"):
+        if sip_from in valid_exts:
+            print(f"[DEBUG] FAST: picked agent via variable_sip_from_user (outbound/local): {sip_from}")
+            return sip_from, "variable_sip_from_user"
+        if cid in valid_exts:
+            print(f"[DEBUG] FAST: picked agent via caller_id_number (outbound/local): {cid}")
+            return cid, "caller_id_number"
+
+    # Generic fallbacks
+    for f, v in (
+        ("variable_sip_to_user", sip_to),
+        ("variable_sip_from_user", sip_from),
+        ("destination_number", dst),
+        ("caller_id_number", cid),
+    ):
+        if v in valid_exts:
+            print(f"[DEBUG] FAST: picked agent via {f}: {v}")
+            return v, f
+
+    return None, ""
 
 
 def is_uuidish(val: Optional[str]) -> bool:
@@ -679,10 +733,14 @@ def parse_args():
     ap.add_argument("--resume", action="store_true", help="Resume using saved state for this domain")
     ap.add_argument("--state", help="Path to state JSON (default ./out/state_<domain>.json)")
     ap.add_argument("--plan", help="Path to write rename plan JSON (default ./out/rename_plan_<domain>.json)")
-    ap.add_argument("--one-file-test", action="store_true", help="Upload only the first eligible file not previously used for one-file tests; stop immediately after")
+    ap.add_argument("--one-file-test", action="store_true",
+                    help="Upload only the first eligible file not previously used for one-file tests; stop immediately after")
     ap.add_argument("--date-range", help="YYYY-MM-DD:YYYY-MM-DD inclusive; scan only this range; ignore resume/seed timing; does not update last_run_time_utc")
     ap.add_argument("--no-prefix", action="store_true", help="Ignore S3_KEY_PREFIX and upload to bucket root")
+    ap.add_argument("--deep-agent", action="store_true",
+                    help="Optional: if FAST agent pick fails, chase bridged legs to find the answered leg (slower).")
     return ap.parse_args()
+
 
 # -------------------- State I/O --------------------
 
@@ -717,11 +775,14 @@ def main():
     state_path = args.state or default_state_path(domain)
     plan_path = args.plan or default_plan_path(domain)
     dry_run = args.dry_run
+    deep_agent = args.deep_agent  # <— only chase b-legs if explicitly asked
 
+    # Load or init state
     state = load_state(state_path)
     if "one_file_test_history" not in state:
-        state["one_file_test_history"] = []
+        state["one_file_test_history"] = []  # absolute paths uploaded during --one-file-test
 
+    # Effective config (resume prefers saved config snapshot)
     cfg = {
         "AUDIO_EXTS": AUDIO_EXTS,
         "MIN_FILE_LENGTH_SECONDS": MIN_FILE_LENGTH_SECONDS,
@@ -741,10 +802,12 @@ def main():
         print("[INFO] --resume: using prior config snapshot")
         cfg = state["config_snapshot"]
 
+    # Init upload history
     if "uploaded_files" not in state:
         state["uploaded_files"] = {}
     uploaded_files = state["uploaded_files"]
 
+    # Retention pruning (by uploaded_at)
     cutoff = datetime.now(timezone.utc) - timedelta(days=int(cfg["RECORD_RETENTION_DAYS"]))
     to_del = [k for k, v in uploaded_files.items()
               if "uploaded_at" in v and datetime.fromisoformat(v["uploaded_at"].replace("Z","+00:00")) < cutoff]
@@ -753,6 +816,7 @@ def main():
     if to_del:
         print(f"[INFO] pruned {len(to_del)} old upload entries older than {cfg['RECORD_RETENTION_DAYS']} days")
 
+    # Determine time window
     should_update_last_run = not (args.date_range or args.one_file_test)
     if args.date_range:
         try:
@@ -781,6 +845,7 @@ def main():
             start_date = last_run.date()
         end_date = datetime.now(timezone.utc).date()
 
+    # DB connect & prep
     print(f"[INFO] Connecting DB {DB_HOST}:{DB_PORT}/{DB_NAME} as {DB_USER} ...")
     conn = connect_db()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
@@ -798,11 +863,13 @@ def main():
     uuid_col = next((c for c in ["xml_cdr_uuid","uuid","call_uuid"] if c in cols_present), None)
     print(f"[INFO] v_xml_cdr columns: {len(cols_present)} detected. Using UUID column: {uuid_col or 'none (fallback search)'}")
 
+    # Scan filesystem by date folders
     root_domain_dir = os.path.join(cfg["FREESWITCH_RECORDING_PATH"], domain, "archive")
     if not os.path.isdir(root_domain_dir):
         print(f"[ERROR] Missing domain archive directory: {root_domain_dir}")
         sys.exit(4)
 
+    # Stats + plan items
     items: List[Dict[str, Any]] = []
     uploaded_this_run: List[Dict[str, Any]] = []
     stats = {
@@ -819,6 +886,7 @@ def main():
         "strategy_counts": {"uuid_col": 0, "fallback_like": 0, "not_found": 0}
     }
 
+    # Build date list inclusive (ascending, deterministic)
     dates: List[date] = []
     d = start_date
     while d <= end_date:
@@ -826,10 +894,16 @@ def main():
         d += timedelta(days=1)
     stats["scanned_days"] = len(dates)
 
+    # Walk by days; FreeSWITCH month is 'Aug', 'Sep'...:
     month_names = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+
+    # UUID filename regex
     uuid_re = re.compile(UUID_REGEX)
+
+    # Control for one-file-test early stop
     stop_scanning = False
 
+    # Iterate day folders
     for day_date in dates:
         if stop_scanning:
             break
@@ -856,20 +930,25 @@ def main():
                 abs_path = os.path.abspath(os.path.join(root, fn))
                 rel_path = os.path.relpath(abs_path, cfg["FREESWITCH_RECORDING_PATH"])
 
+                # Quickly require UUIDish base name
                 base = os.path.splitext(fn)[0]
                 if not uuid_re.fullmatch(base):
+                    # Not a UUID style file — skip
                     continue
                 uuid = base
 
+                # Duration check
                 duration = get_audio_duration(abs_path)
                 if duration < float(cfg["MIN_FILE_LENGTH_SECONDS"]):
                     continue
                 stats["files_duration_ok"] += 1
 
+                # Skip if this file was already one-file-tested or uploaded before
                 if args.one_file_test:
                     if abs_path in state.get("one_file_test_history", []):
                         continue
                 if abs_path in uploaded_files:
+                    # already uploaded in a prior run (never upload same file twice)
                     entry_already = {
                         "uuid": uuid,
                         "original": {
@@ -889,6 +968,7 @@ def main():
                     items.append(entry_already)
                     continue
 
+                # CDR fetch
                 sql, params, cdr_row, strategy = fetch_cdr_by_uuid(cur, uuid, cols_present, uuid_col)
                 stats["strategy_counts"][strategy] = stats["strategy_counts"].get(strategy, 0) + 1
 
@@ -921,6 +1001,7 @@ def main():
 
                 stats["cdr_found"] += 1
 
+                # CDR subset out
                 cdr_subset_fields = [
                     "caller_id_name","caller_id_number","destination_number","direction",
                     "start_stamp","end_stamp","billsec","answer_stamp","hangup_cause",
@@ -939,45 +1020,51 @@ def main():
                         cdr_out[k] = v
                 entry["cdr"] = cdr_out
 
-                # -------------------- Agent detection (answered leg logic) --------------------
+                # -------------------- FAST Agent detection (seed row only) --------------------
                 print("\n[DEBUG] v_xml_cdr lookup strategy:", strategy)
                 print("[DEBUG] Table: v_xml_cdr (seed a-leg) | UUID:", uuid)
                 print("[DEBUG] Direction:", cdr_row.get("direction"),
                       "| caller_id_number:", cdr_row.get("caller_id_number"),
                       "| destination_number:", cdr_row.get("destination_number"))
 
-                related_rows = fetch_related_cdr_rows(cur, cdr_row, cols_present, uuid_col)
-                if len(related_rows) > 1:
-                    print(f"[DEBUG] Found {len(related_rows)} related CDR row(s) including seed (a/b legs).")
-                else:
-                    print("[DEBUG] No additional related rows (no bridge UUIDs present).")
+                agent_ext, agent_src = fast_pick_agent_from_seed_row(cdr_row, valid_exts)
 
-                agent_ext, agent_src_field, chosen_row = pick_answered_agent_from_rows(related_rows, valid_exts)
+                # If fast path failed AND user asked for deep chase, try answered-leg across related rows
+                if not agent_ext and deep_agent:
+                    related_rows = fetch_related_cdr_rows(cur, cdr_row, cols_present, uuid_col)
+                    if len(related_rows) > 1:
+                        print(f"[DEBUG] (DEEP) Found {len(related_rows)} related CDR row(s) including seed.")
+                    else:
+                        print("[DEBUG] (DEEP) No additional related rows (no bridge UUIDs present).")
+                    agent_ext_deep, agent_src_field_deep, _chosen_row = pick_answered_agent_from_rows(related_rows, valid_exts)
+                    if agent_ext_deep:
+                        agent_ext, agent_src = agent_ext_deep, agent_src_field_deep
+                        print(f"[DEBUG] (DEEP) AGENT CHOSEN: {agent_ext}  (via {agent_src})")
 
                 if not agent_ext:
                     entry["decision"] = {
                         "rule": "no_agent_match",
-                        "note": "no extension found on answered leg(s)",
+                        "note": "no extension found (fast path" + ("/deep" if deep_agent else "") + ")",
                         "agent": None,
                         "cust": None,
                         "match_locations": []
                     }
                     entry["status"] = "no_agent_match"
-                    entry["reason"] = "no extension found on answered leg(s)"
+                    entry["reason"] = "no extension found"
                     stats["no_agent_match"] += 1
                     print("[DEBUG] AGENT: <none> (no_agent_match)")
                     items.append(entry)
                     continue
 
-                decision_rule = "answered_leg_agent"
-                decision_note = f"Picked answered leg; extension via {agent_src_field}"
-                agent_src = agent_src_field
-                print(f"[DEBUG] AGENT CHOSEN: {agent_ext}  (via {agent_src_field})")
+                decision_rule = "fast_agent" if not deep_agent else "fast_or_deep_agent"
+                decision_note = f"Extension via {agent_src}"
+                print(f"[DEBUG] AGENT CHOSEN: {agent_ext}  (via {agent_src})")
                 # -------------------------------------------------------------------------------
 
-                # CUST detection (still taken from the seed row context)
+                # CUST detection
                 cust_digits, cust_source_field = find_cust_digits_anywhere(cdr_row, agent_ext, valid_exts)
                 if not cust_digits:
+                    # fallback final cleanup
                     _, cust_raw = prefer_external_number(
                         str(cdr_row.get("caller_id_number") or ""),
                         str(cdr_row.get("destination_number") or ""),
@@ -989,6 +1076,7 @@ def main():
                 dt_best = pick_best_datetime(cdr_row, entry["original"]["mtime_utc"])
                 s3_name = build_precise_s3_name(domain, cust_digits, uuid, agent_ext, dt_best, ext)
 
+                # Components + provenance for JSON
                 proposed = {
                     "s3_upload_filename": s3_name,
                     "s3_components": {
@@ -1012,6 +1100,7 @@ def main():
                 print(f"[DEBUG] S3 KEY: {s3_key_preview}")
                 # --------------------------------------------------------------------------
 
+                # Allow agent filter (optional)
                 if AGENT_UPLOAD_FILTER_ARRAY and agent_ext not in AGENT_UPLOAD_FILTER_ARRAY:
                     entry["decision"] = {
                         "rule": decision_rule + " (agent_filtered)",
@@ -1026,6 +1115,7 @@ def main():
                     items.append(entry)
                     continue
 
+                # Final decision
                 entry["decision"] = {
                     "rule": decision_rule,
                     "note": decision_note,
@@ -1039,9 +1129,12 @@ def main():
                 entry["status"] = "ok"
                 stats["mapped_agent_cust"] += 1
 
+                # ---- Upload or skip based on state (never re-upload same absolute path)
+                # Flatten S3 key (keep prefix if configured)
                 prefix = "" if args.no_prefix else (cfg["S3_KEY_PREFIX"] or "")
                 s3_key = s3_name if not prefix else f"{prefix.rstrip('/')}/{s3_name}"
 
+                # Dedupe by absolute path across ALL modes
                 k = entry["original"]["absolute_path"]
                 if k in uploaded_files:
                     entry["status"] = "already_uploaded"
@@ -1069,6 +1162,7 @@ def main():
                     s3.upload_file(k, S3_BUCKET_NAME, s3_key, ExtraArgs={kv: vv for kv, vv in extra.items() if vv})
                     stats["uploads_done"] += 1
                     did_upload = True
+                    # Track in state (path-based dedupe)
                     uploaded_files[k] = {
                         "uploaded_at": datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),
                         "file_size": int(sz_now),
@@ -1088,14 +1182,20 @@ def main():
 
                 items.append(entry)
 
+                # Early-stop logic for --one-file-test
                 if args.one_file_test and (did_upload or would_upload):
                     if did_upload:
                         state["one_file_test_history"].append(k)
                     stop_scanning = True
 
+        # end os.walk
+    # end day loop
+
+    # Done DB
     cur.close()
     conn.close()
 
+    # Write plan JSON
     run_meta = {
         "generated_utc": datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),
         "domain": domain,
@@ -1110,6 +1210,7 @@ def main():
         json.dump(plan_safe, f, indent=2)
     print(f"[INFO] Wrote rename plan -> {plan_path}")
 
+    # Update & save state
     if should_update_last_run:
         state["last_run_time_utc"] = datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
     state["config_snapshot"] = cfg
@@ -1118,6 +1219,7 @@ def main():
     save_state(state_path, state)
     print(f"[INFO] Saved state -> {state_path}")
 
+    # Step Functions trigger
     if STEP_FUNCTION_ARN and not dry_run and uploaded_this_run:
         print(f"[INFO] Triggering Step Function: {STEP_FUNCTION_ARN} with {len(uploaded_this_run)} file(s)")
         sf = step_client(STEP_FUNCTION_REGION)
@@ -1149,10 +1251,12 @@ def main():
         else:
             print("[INFO] No new uploads this run; Step Functions not triggered.")
 
+    # Summary
     print("\n===== SUMMARY =====")
     print(json.dumps(make_json_safe(stats), indent=2))
     printable = sum(1 for it in items if it.get("status") == "ok")
     print(f"Files with a valid AGENT/CUST mapping (would be renamed): {printable}")
+
 
 
 if __name__ == "__main__":
