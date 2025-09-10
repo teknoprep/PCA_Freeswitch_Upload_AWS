@@ -388,6 +388,79 @@ def find_agent_anywhere(cdr: Dict[str, Any], valid_exts: set) -> Tuple[Optional[
                         break
             return ext, hits, source_field
     return None, [], ""
+	
+def resolve_agent_extension(cdr: Dict[str, Any], valid_exts: set) -> Tuple[Optional[str], str, List[Dict[str, str]]]:
+    """
+    Returns (agent_ext, agent_source_field, hits)
+
+    Priority order:
+      1) presence_id like '1012@domain'  → reliable indicator of the active internal endpoint
+      2) SIP users (direction-aware): inbound prefers sip_to_user; outbound prefers sip_from_user
+      3) caller/destination_number (direction-aware)
+      4) fallback: find_agent_anywhere (your existing broad search)
+    """
+    hits: List[Dict[str, str]] = []
+
+    def ext_if_valid(val: Optional[str]) -> Optional[str]:
+        v = str(val or "").strip()
+        return v if (v in valid_exts) else None
+
+    # 1) presence_id (often "EXT@domain")
+    pres = str(cdr.get("presence_id") or "")
+    if "@" in pres:
+        ext_candidate = pres.split("@", 1)[0]
+        if ext_candidate in valid_exts:
+            return ext_candidate, "presence_id", hits
+
+    # 2) SIP users, prefer callee on inbound, caller on outbound
+    direction = (cdr.get("direction") or "").lower()
+    sip_to = cdr.get("variable_sip_to_user")
+    sip_from = cdr.get("variable_sip_from_user")
+    if direction == "inbound":
+        ext = ext_if_valid(sip_to) or ext_if_valid(sip_from)
+        if ext:
+            return ext, "sip_user(inbound_pref_to)", hits
+    elif direction == "outbound":
+        ext = ext_if_valid(sip_from) or ext_if_valid(sip_to)
+        if ext:
+            return ext, "sip_user(outbound_pref_from)", hits
+    else:
+        # unknown direction—still try both
+        ext = ext_if_valid(sip_to) or ext_if_valid(sip_from)
+        if ext:
+            return ext, "sip_user(unknown_dir)", hits
+
+    # 3) Caller/Destination, direction-aware
+    cid = cdr.get("caller_id_number")
+    dst = cdr.get("destination_number")
+    cid_in = str(cid or "") in valid_exts
+    dst_in = str(dst or "") in valid_exts
+    if direction == "inbound":
+        if dst_in:  # agent is the callee
+            return str(dst), "destination_number(inbound)", hits
+        if cid_in:
+            return str(cid), "caller_id_number(inbound_fallback)", hits
+    elif direction == "outbound":
+        if cid_in:  # agent is the caller
+            return str(cid), "caller_id_number(outbound)", hits
+        if dst_in:
+            return str(dst), "destination_number(outbound_fallback)", hits
+    else:
+        # unknown direction—keep original tie-breaker but only if one matches
+        if cid_in and not dst_in:
+            return str(cid), "caller_id_number", hits
+        if dst_in and not cid_in:
+            return str(dst), "destination_number", hits
+        if cid_in and dst_in:
+            return str(dst), "both_in_ext_choose_destination", hits
+
+    # 4) Fallback to broad search (existing behavior)
+    agent_ext, broad_hits, agent_src = find_agent_anywhere(cdr, valid_exts)
+    if agent_ext:
+        return agent_ext, f"fallback_anywhere:{agent_src}", broad_hits
+
+    return None, "", []
+
 
 def prefer_external_number(caller_id_number: Optional[str], destination_number: Optional[str], agent_ext: Optional[str]) -> Tuple[str, str]:
     cid = digits_only(caller_id_number)
@@ -783,45 +856,25 @@ def main():
                         cdr_out[k] = v
                 entry["cdr"] = cdr_out
 
-                # Agent detection
-                agent_ext, hits, agent_src = find_agent_anywhere(cdr_row, valid_exts)
-                decision_rule = ""
-                decision_note = ""
-                if agent_ext:
-                    decision_rule = "agent_found_anywhere_in_cdr"
-                    decision_note = f"Matched extension {agent_ext} (source field: {agent_src})."
-                else:
-                    # try direct caller/destination equality
-                    valid_set = set(valid_exts)
-                    cid = str(cdr_row.get("caller_id_number") or "")
-                    dst = str(cdr_row.get("destination_number") or "")
-                    cid_in = cid in valid_set
-                    dst_in = dst in valid_set
-                    if cid_in and not dst_in:
-                        agent_ext = cid; agent_src = "caller_id_number"
-                        decision_rule = "caller_is_agent"
-                        decision_note = "caller_id_number matched a valid extension"
-                    elif dst_in and not cid_in:
-                        agent_ext = dst; agent_src = "destination_number"
-                        decision_rule = "destination_is_agent"
-                        decision_note = "destination_number matched a valid extension"
-                    elif cid_in and dst_in:
-                        agent_ext = dst; agent_src = "destination_number"
-                        decision_rule = "both_in_ext_choose_destination"
-                        decision_note = "both matched; chose destination as agent"
-                    else:
-                        entry["decision"] = {
-                            "rule": "no_agent_match",
-                            "note": "no extension found anywhere in CDR",
-                            "agent": None,
-                            "cust": None,
-                            "match_locations": hits
-                        }
-                        entry["status"] = "no_agent_match"
-                        entry["reason"] = "no extension found anywhere in CDR"
-                        stats["no_agent_match"] += 1
-                        items.append(entry)
-                        continue
+                # -------------------- NEW agent detection (priority resolver) --------------------
+                agent_ext, agent_src, hits = resolve_agent_extension(cdr_row, valid_exts)
+                if not agent_ext:
+                    entry["decision"] = {
+                        "rule": "no_agent_match",
+                        "note": "no extension found with prioritized rules",
+                        "agent": None,
+                        "cust": None,
+                        "match_locations": hits
+                    }
+                    entry["status"] = "no_agent_match"
+                    entry["reason"] = "no extension found"
+                    stats["no_agent_match"] += 1
+                    items.append(entry)
+                    continue
+
+                decision_rule = "agent_resolver_priority"
+                decision_note = f"Selected {agent_ext} via {agent_src}"
+                # -------------------------------------------------------------------------------
 
                 # CUST detection
                 cust_digits, cust_source_field = find_cust_digits_anywhere(cdr_row, agent_ext, valid_exts)
@@ -1011,6 +1064,7 @@ def main():
     print(json.dumps(make_json_safe(stats), indent=2))
     printable = sum(1 for it in items if it.get("status") == "ok")
     print(f"Files with a valid AGENT/CUST mapping (would be renamed): {printable}")
+
 
 if __name__ == "__main__":
     main()
