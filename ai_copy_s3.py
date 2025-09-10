@@ -484,6 +484,87 @@ def collect_extension_hits(cdr: Dict[str, Any], valid_exts: set) -> Dict[str, Li
     # Convert sets to sorted lists for readability
     return {k: sorted(list(v), key=lambda x: (len(x), x)) for k, v in hits.items()}
 
+def is_uuidish(val: Optional[str]) -> bool:
+    try:
+        s = str(val or "").strip()
+        if not s:
+            return False
+        return re.fullmatch(UUID_REGEX, s) is not None
+    except Exception:
+        return False
+def resolve_agent_with_bridge(cur,
+                              cdr_row: Dict[str, Any],
+                              valid_exts: set,
+                              cols_present: set,
+                              uuid_col: Optional[str]) -> Tuple[Optional[str], str, List[Dict[str, str]]]:
+    """
+    Try agent on the current row (a-leg). If not decisive, follow bridge UUIDs
+    to the b-leg row and resolve there. Returns (agent_ext, agent_source_field, hits).
+    """
+    # 1) Try on the current row first
+    agent_ext, agent_src, hits = resolve_agent_extension(cdr_row, valid_exts)
+    if agent_ext and not agent_src.startswith("fallback_anywhere"):
+        return agent_ext, f"a-leg:{agent_src}", hits
+
+    # 2) Bridge candidates to inspect
+    b_uuid_candidates = []
+    for key in ("bridge_uuid", "bleg_uuid", "variable_bridge_id"):
+        val = cdr_row.get(key)
+        if is_uuidish(val):
+            b_uuid_candidates.append((key, str(val)))
+
+    # No bridge info available
+    seen = set()
+    for src_key, b_uuid in b_uuid_candidates:
+        if b_uuid in seen:
+            continue
+        seen.add(b_uuid)
+
+        # Fetch b-leg CDR row
+        sql_b, params_b, cdr_b, strat_b = fetch_cdr_by_uuid(cur, b_uuid, cols_present, uuid_col)
+
+        # Debug prints for b-leg
+        print(f"[DEBUG] BRIDGE LOOKUP via {src_key}: {b_uuid}")
+        print(f"[DEBUG] v_xml_cdr lookup strategy (b-leg): {strat_b}")
+        if not cdr_b:
+            print("[DEBUG] b-leg row not found.")
+            continue
+
+        print("[DEBUG] b-leg Direction:", cdr_b.get("direction"),
+              "| caller_id_number:", cdr_b.get("caller_id_number"),
+              "| destination_number:", cdr_b.get("destination_number"))
+
+        # Field-by-field extension hits on b-leg
+        ext_hits_b = collect_extension_hits(cdr_b, valid_exts)
+        if ext_hits_b:
+            print("[DEBUG] b-leg extension hits per field (valid_exts only):")
+            priority = [
+                "presence_id","variable_sip_to_user","variable_sip_from_user",
+                "destination_number","caller_id_number",
+                "caller_destination","last_arg","context","user_context",
+                "variables","json","raw_json","call_json"
+            ]
+            printed = set()
+            for fld in priority:
+                if fld in ext_hits_b:
+                    print(f"  - {fld}: {', '.join(ext_hits_b[fld])}")
+                    printed.add(fld)
+            for fld in sorted(ext_hits_b.keys()):
+                if fld not in printed:
+                    print(f"  - {fld}: {', '.join(ext_hits_b[fld])}")
+        else:
+            print("[DEBUG] b-leg has no valid extension strings in single fields.")
+
+        # Now resolve on b-leg
+        agent_b, agent_src_b, hits_b = resolve_agent_extension(cdr_b, valid_exts)
+        if agent_b:
+            print(f"[DEBUG] AGENT CHOSEN (b-leg): {agent_b}  (via {agent_src_b})")
+            return agent_b, f"b-leg:{agent_src_b}", hits_b
+
+    # Fallback to whatever we had on a-leg (even if it was the broad fallback) or None
+    if agent_ext:
+        return agent_ext, f"a-leg:{agent_src}", hits
+    return None, "", []
 
 def prefer_external_number(caller_id_number: Optional[str], destination_number: Optional[str], agent_ext: Optional[str]) -> Tuple[str, str]:
     cid = digits_only(caller_id_number)
@@ -756,7 +837,7 @@ def main():
     # Walk by days; FreeSWITCH month is 'Aug', 'Sep'...:
     month_names = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
 
-    # UUID filename regex
+    # UUID filename regex (for filenames)
     uuid_re = re.compile(UUID_REGEX)
 
     # Control for one-file-test early stop
@@ -789,10 +870,9 @@ def main():
                 abs_path = os.path.abspath(os.path.join(root, fn))
                 rel_path = os.path.relpath(abs_path, cfg["FREESWITCH_RECORDING_PATH"])
 
-                # Quickly require UUIDish base name
+                # Require UUIDish base name for FreeSWITCH recordings
                 base = os.path.splitext(fn)[0]
                 if not uuid_re.fullmatch(base):
-                    # Not a UUID style file — skip
                     continue
                 uuid = base
 
@@ -807,7 +887,6 @@ def main():
                     if abs_path in state.get("one_file_test_history", []):
                         continue
                 if abs_path in uploaded_files:
-                    # already uploaded in a prior run (never upload same file twice)
                     entry_already = {
                         "uuid": uuid,
                         "original": {
@@ -827,7 +906,7 @@ def main():
                     items.append(entry_already)
                     continue
 
-                # CDR fetch
+                # CDR fetch (a-leg by recording UUID)
                 sql, params, cdr_row, strategy = fetch_cdr_by_uuid(cur, uuid, cols_present, uuid_col)
                 stats["strategy_counts"][strategy] = stats["strategy_counts"].get(strategy, 0) + 1
 
@@ -860,7 +939,7 @@ def main():
 
                 stats["cdr_found"] += 1
 
-                # CDR subset out
+                # Subset out a-leg CDR fields for plan/debug
                 cdr_subset_fields = [
                     "caller_id_name","caller_id_number","destination_number","direction",
                     "start_stamp","end_stamp","billsec","answer_stamp","hangup_cause",
@@ -879,16 +958,15 @@ def main():
                         cdr_out[k] = v
                 entry["cdr"] = cdr_out
 
-                # -------------------- DEBUG: print where extensions appear --------------------
+                # -------------------- DEBUG: a-leg field hits --------------------
                 ext_hits = collect_extension_hits(cdr_row, valid_exts)
                 print("\n[DEBUG] v_xml_cdr lookup strategy:", strategy)
-                print("[DEBUG] Table: v_xml_cdr  |  UUID:", uuid)
+                print("[DEBUG] Table: v_xml_cdr (a-leg) | UUID:", uuid)
                 print("[DEBUG] Direction:", cdr_row.get("direction"),
                       "| caller_id_number:", cdr_row.get("caller_id_number"),
                       "| destination_number:", cdr_row.get("destination_number"))
                 if ext_hits:
-                    print("[DEBUG] Extension hits per field (valid_exts only):")
-                    # Print stable order: prioritize common fields, then others
+                    print("[DEBUG] a-leg extension hits per field (valid_exts only):")
                     priority = [
                         "presence_id","variable_sip_to_user","variable_sip_from_user",
                         "destination_number","caller_id_number",
@@ -904,15 +982,15 @@ def main():
                         if fld not in printed:
                             print(f"  - {fld}: {', '.join(ext_hits[fld])}")
                 else:
-                    print("[DEBUG] No valid extension strings found in any single CDR field.")
-                # ---------------------------------------------------------------------------
+                    print("[DEBUG] No valid extension strings found in any single a-leg field.")
+                # ----------------------------------------------------------------
 
-                # -------------------- NEW agent detection (priority resolver) --------------------
-                agent_ext, agent_src, hits = resolve_agent_extension(cdr_row, valid_exts)
+                # -------------------- Agent detection (a-leg and bridge b-leg) --------------------
+                agent_ext, agent_src, hits = resolve_agent_with_bridge(cur, cdr_row, valid_exts, cols_present, uuid_col)
                 if not agent_ext:
                     entry["decision"] = {
                         "rule": "no_agent_match",
-                        "note": "no extension found with prioritized rules",
+                        "note": "no extension found with prioritized rules (a-leg and b-leg)",
                         "agent": None,
                         "cust": None,
                         "match_locations": hits
@@ -920,19 +998,18 @@ def main():
                     entry["status"] = "no_agent_match"
                     entry["reason"] = "no extension found"
                     stats["no_agent_match"] += 1
-                    print("[DEBUG] AGENT: <none> (no_agent_match)")
+                    print("[DEBUG] AGENT: <none> (no_agent_match across a/b-leg)")
                     items.append(entry)
                     continue
 
                 decision_rule = "agent_resolver_priority"
                 decision_note = f"Selected {agent_ext} via {agent_src}"
                 print(f"[DEBUG] AGENT CHOSEN: {agent_ext}  (via {agent_src})")
-                # -------------------------------------------------------------------------------
+                # ---------------------------------------------------------------------------------
 
                 # CUST detection
                 cust_digits, cust_source_field = find_cust_digits_anywhere(cdr_row, agent_ext, valid_exts)
                 if not cust_digits:
-                    # fallback final cleanup
                     _, cust_raw = prefer_external_number(
                         str(cdr_row.get("caller_id_number") or ""),
                         str(cdr_row.get("destination_number") or ""),
@@ -961,7 +1038,7 @@ def main():
                     "new_absolute_path": os.path.join(os.path.dirname(entry["original"]["absolute_path"]), f"{cust_digits or 'UNKNOWN'}-{agent_ext or 'UNKNOWN'}-{uuid}{ext}")
                 }
 
-                # -------------------- DEBUG: filename changes --------------------
+                # -------------------- DEBUG: filenames & S3 key --------------------
                 print(f"[DEBUG] FILENAME: original_basename='{fn}'  |  new_basename='{proposed['new_basename']}'")
                 prefix = "" if args.no_prefix else (cfg["S3_KEY_PREFIX"] or "")
                 s3_key_preview = s3_name if not prefix else f"{prefix.rstrip('/')}/{s3_name}"
@@ -1029,7 +1106,6 @@ def main():
                     s3.upload_file(k, S3_BUCKET_NAME, s3_key, ExtraArgs={kv: vv for kv, vv in extra.items() if vv})
                     stats["uploads_done"] += 1
                     did_upload = True
-                    # Track in state (path-based dedupe)
                     uploaded_files[k] = {
                         "uploaded_at": datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),
                         "file_size": int(sz_now),
@@ -1123,6 +1199,7 @@ def main():
     print(json.dumps(make_json_safe(stats), indent=2))
     printable = sum(1 for it in items if it.get("status") == "ok")
     print(f"Files with a valid AGENT/CUST mapping (would be renamed): {printable}")
+
 
 
 
