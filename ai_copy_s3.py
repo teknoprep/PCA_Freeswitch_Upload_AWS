@@ -375,8 +375,9 @@ def stringify_cdr_row(cdr: Dict[str, Any]) -> Tuple[str, List[Dict[str, str]]]:
 
 def find_agent_anywhere(cdr: Dict[str, Any], valid_exts: set) -> Tuple[Optional[str], List[Dict[str, str]], str]:
     blob, locs = stringify_cdr_row(cdr)
+    # Use alphanumeric boundaries so we don't match inside UUIDs or SIP URIs parts
     for ext in sorted(valid_exts, key=len, reverse=True):
-        pat = re.compile(rf"(?<!\d){re.escape(ext)}(?!\d)")
+        pat = re.compile(rf"(?<![0-9A-Za-z]){re.escape(ext)}(?![0-9A-Za-z])")
         if pat.search(blob):
             hits = []
             source_field = "any"
@@ -389,6 +390,7 @@ def find_agent_anywhere(cdr: Dict[str, Any], valid_exts: set) -> Tuple[Optional[
             return ext, hits, source_field
     return None, [], ""
 
+
 def is_uuidish(val: Optional[str]) -> bool:
     try:
         s = str(val or "").strip()
@@ -398,6 +400,10 @@ def is_uuidish(val: Optional[str]) -> bool:
     except Exception:
         return False
 def collect_extension_hits(cdr: Dict[str, Any], valid_exts: set) -> Dict[str, List[str]]:
+    """
+    Return: field_name -> sorted list of valid extensions that appear in that field's value.
+    Uses ALPHANUMERIC boundaries so '103' won't match inside a hex UUID string.
+    """
     hits: Dict[str, set] = {}
     for k, v in cdr.items():
         if v is None:
@@ -407,12 +413,13 @@ def collect_extension_hits(cdr: Dict[str, Any], valid_exts: set) -> Dict[str, Li
             continue
         field_hits = set()
         for ext in valid_exts:
-            pat = re.compile(rf"(?<!\d){re.escape(ext)}(?!\d)")
+            pat = re.compile(rf"(?<![0-9A-Za-z]){re.escape(ext)}(?![0-9A-Za-z])")
             if pat.search(s):
                 field_hits.add(ext)
         if field_hits:
             hits[k] = field_hits
     return {k: sorted(list(v), key=lambda x: (len(x), x)) for k, v in hits.items()}
+
   
 def fetch_related_cdr_rows(cur,
                            seed_row: Dict[str, Any],
