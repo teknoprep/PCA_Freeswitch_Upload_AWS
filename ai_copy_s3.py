@@ -309,7 +309,9 @@ def fetch_valid_extensions(cur, domain_uuid: str) -> List[str]:
     return sorted(set(out))
 
 def make_select_clause(cols_present: set) -> str:
+    # add 'extension' first – FusionPBX populates this with the answered user/extension shown in the UI
     candidates = [
+        "extension", "extension_uuid",
         "caller_id_name","caller_id_number","destination_number","direction",
         "start_stamp","end_stamp","billsec","answer_stamp","hangup_cause",
         "accountcode","domain_uuid","record_name","record_path",
@@ -320,6 +322,7 @@ def make_select_clause(cols_present: set) -> str:
     ]
     actual = [c for c in candidates if c in cols_present]
     return ", ".join(actual) if actual else "*"
+
 
 def fetch_cdr_by_uuid(cur, uuid: str, cols_present: set, uuid_col: Optional[str]):
     select_clause = make_select_clause(cols_present)
@@ -390,60 +393,59 @@ def find_agent_anywhere(cdr: Dict[str, Any], valid_exts: set) -> Tuple[Optional[
             return ext, hits, source_field
     return None, [], ""
 
-def fast_pick_agent_from_seed_row(cdr_row: Dict[str, Any], valid_exts: set) -> Tuple[Optional[str], str]:
+def fast_pick_agent_from_seed_row(cdr: Dict[str, Any], valid_exts: set) -> Tuple[Optional[str], str]:
     """
-    SUPER-FAST decision using only the seed row (the one we found by UUID).
-    Priority mirrors what the CDR UI typically surfaces:
-
-    1) presence_id -> EXT@domain  (EXT must be a valid extension)
-    2) Direction-aware SIP users and numbers:
-       - inbound/local:  variable_sip_to_user, destination_number
-       - outbound/local: variable_sip_from_user, caller_id_number
-    3) Fallbacks: variable_sip_to_user, variable_sip_from_user, destination_number, caller_id_number
+    Minimal, fast agent detector that mirrors FusionPBX XML CDR UI:
+    1) Use v_xml_cdr.extension if it exists and is a valid extension.
+    2) Fallbacks that are still single-field and cheap.
+    Returns (agent_ext, source_field)
     """
-    direction = str(cdr_row.get("direction") or "").lower()
-    presence_id = str(cdr_row.get("presence_id") or "")
-    sip_to = str(cdr_row.get("variable_sip_to_user") or "")
-    sip_from = str(cdr_row.get("variable_sip_from_user") or "")
-    cid = str(cdr_row.get("caller_id_number") or "")
-    dst = str(cdr_row.get("destination_number") or "")
+    def as_str(x): return ("" if x is None else str(x)).strip()
 
-    # presence_id like "103@domain"
-    if "@" in presence_id:
-        ext = presence_id.split("@", 1)[0]
-        if ext in valid_exts:
-            print(f"[DEBUG] FAST: picked agent via presence_id: {ext}")
-            return ext, "presence_id"
+    # 1) primary: 'extension' column from v_xml_cdr (what the UI shows)
+    ext_col = as_str(cdr.get("extension"))
+    if ext_col and ext_col in valid_exts:
+        return ext_col, "extension"
 
-    # Direction-aware picks
+    # 2) accountcode sometimes set to the answering extension
+    acc = as_str(cdr.get("accountcode"))
+    if acc and acc in valid_exts:
+        return acc, "accountcode"
+
+    # 3) presence_id like "103@domain" -> 103
+    pres = as_str(cdr.get("presence_id"))
+    if pres:
+        m = re.match(r"(\d+)(?:@|$)", pres)
+        if m and m.group(1) in valid_exts:
+            return m.group(1), "presence_id"
+
+    # 4) SIP users captured on the leg
+    sip_to = as_str(cdr.get("variable_sip_to_user"))
+    if sip_to and sip_to in valid_exts:
+        return sip_to, "variable_sip_to_user"
+    sip_from = as_str(cdr.get("variable_sip_from_user"))
+    if sip_from and sip_from in valid_exts:
+        return sip_from, "variable_sip_from_user"
+
+    # 5) Directional single-field fallback (cheap, no full-text scans)
+    direction = as_str(cdr.get("direction")).lower()
+    cid = as_str(cdr.get("caller_id_number"))
+    dst = as_str(cdr.get("destination_number"))
+
     if direction in ("inbound", "local"):
-        if sip_to in valid_exts:
-            print(f"[DEBUG] FAST: picked agent via variable_sip_to_user (inbound/local): {sip_to}")
-            return sip_to, "variable_sip_to_user"
         if dst in valid_exts:
-            print(f"[DEBUG] FAST: picked agent via destination_number (inbound/local): {dst}")
+            return dst, "destination_number"
+        if cid in valid_exts:
+            return cid, "caller_id_number"
+    elif direction == "outbound":
+        if cid in valid_exts:
+            return cid, "caller_id_number"
+        if dst in valid_exts:
             return dst, "destination_number"
 
-    if direction in ("outbound", "local"):
-        if sip_from in valid_exts:
-            print(f"[DEBUG] FAST: picked agent via variable_sip_from_user (outbound/local): {sip_from}")
-            return sip_from, "variable_sip_from_user"
-        if cid in valid_exts:
-            print(f"[DEBUG] FAST: picked agent via caller_id_number (outbound/local): {cid}")
-            return cid, "caller_id_number"
-
-    # Generic fallbacks
-    for f, v in (
-        ("variable_sip_to_user", sip_to),
-        ("variable_sip_from_user", sip_from),
-        ("destination_number", dst),
-        ("caller_id_number", cid),
-    ):
-        if v in valid_exts:
-            print(f"[DEBUG] FAST: picked agent via {f}: {v}")
-            return v, f
-
+    # no fast match
     return None, ""
+
 
 
 def is_uuidish(val: Optional[str]) -> bool:
@@ -1003,6 +1005,7 @@ def main():
 
                 # CDR subset out
                 cdr_subset_fields = [
+                    "extension",  # <-- added
                     "caller_id_name","caller_id_number","destination_number","direction",
                     "start_stamp","end_stamp","billsec","answer_stamp","hangup_cause",
                     "accountcode","domain_uuid","record_name","record_path",
@@ -1011,6 +1014,7 @@ def main():
                     "variable_bridge_id","variable_sip_to_user","variable_sip_from_user",
                     "variables","json","raw_json","call_json"
                 ]
+
                 cdr_out = {}
                 for k in cdr_subset_fields:
                     if k in cdr_row:
@@ -1020,46 +1024,68 @@ def main():
                         cdr_out[k] = v
                 entry["cdr"] = cdr_out
 
-                # -------------------- FAST Agent detection (seed row only) --------------------
-                print("\n[DEBUG] v_xml_cdr lookup strategy:", strategy)
-                print("[DEBUG] Table: v_xml_cdr (seed a-leg) | UUID:", uuid)
-                print("[DEBUG] Direction:", cdr_row.get("direction"),
-                      "| caller_id_number:", cdr_row.get("caller_id_number"),
-                      "| destination_number:", cdr_row.get("destination_number"))
+                                # Agent detection (FAST, single-row, no heavy scans)
+                # ------------------------------------------------
+                # Debug: show the core fields first (mirrors UI)
+                dbg_direction = str(cdr_row.get("direction") or "")
+                dbg_cid = str(cdr_row.get("caller_id_number") or "")
+                dbg_dst = str(cdr_row.get("destination_number") or "")
+                print(f"\n[DEBUG] v_xml_cdr lookup strategy: {strategy}")
+                print(f"[DEBUG] Table: v_xml_cdr (seed a-leg) | UUID: {uuid}")
+                print(f"[DEBUG] Direction: {dbg_direction} | caller_id_number: {dbg_cid} | destination_number: {dbg_dst}")
 
-                agent_ext, agent_src = fast_pick_agent_from_seed_row(cdr_row, valid_exts)
-
-                # If fast path failed AND user asked for deep chase, try answered-leg across related rows
-                if not agent_ext and deep_agent:
-                    related_rows = fetch_related_cdr_rows(cur, cdr_row, cols_present, uuid_col)
-                    if len(related_rows) > 1:
-                        print(f"[DEBUG] (DEEP) Found {len(related_rows)} related CDR row(s) including seed.")
+                # Candidate single-field matches
+                cand_fields = [
+                    ("extension", cdr_row.get("extension")),
+                    ("accountcode", cdr_row.get("accountcode")),
+                    ("presence_id", cdr_row.get("presence_id")),
+                    ("variable_sip_to_user", cdr_row.get("variable_sip_to_user")),
+                    ("variable_sip_from_user", cdr_row.get("variable_sip_from_user")),
+                ]
+                per_field_hits = []
+                for fname, fval in cand_fields:
+                    if fval is None:
+                        continue
+                    sval = str(fval).strip()
+                    # presence_id comes like '103@domain'
+                    if fname == "presence_id":
+                        m = re.match(r"(\d+)(?:@|$)", sval)
+                        if m and m.group(1) in valid_exts:
+                            per_field_hits.append((fname, m.group(1)))
                     else:
-                        print("[DEBUG] (DEEP) No additional related rows (no bridge UUIDs present).")
-                    agent_ext_deep, agent_src_field_deep, _chosen_row = pick_answered_agent_from_rows(related_rows, valid_exts)
-                    if agent_ext_deep:
-                        agent_ext, agent_src = agent_ext_deep, agent_src_field_deep
-                        print(f"[DEBUG] (DEEP) AGENT CHOSEN: {agent_ext}  (via {agent_src})")
+                        if sval in valid_exts:
+                            per_field_hits.append((fname, sval))
+
+                if per_field_hits:
+                    print("[DEBUG] Single-field extension candidates in seed row:")
+                    for fname, hit in per_field_hits:
+                        print(f"    - {fname}: {hit}")
+                else:
+                    print("[DEBUG] No single-field extension match present in seed row.")
+
+                # actual pick (FAST)
+                agent_ext, agent_src = fast_pick_agent_from_seed_row(cdr_row, valid_exts)
+                hits = []  # keep for JSON structure compatibility
 
                 if not agent_ext:
                     entry["decision"] = {
                         "rule": "no_agent_match",
-                        "note": "no extension found (fast path" + ("/deep" if deep_agent else "") + ")",
+                        "note": "no extension found in standard CDR fields (extension/accountcode/presence_id/sip users/caller-dst by direction)",
                         "agent": None,
                         "cust": None,
-                        "match_locations": []
+                        "match_locations": hits
                     }
                     entry["status"] = "no_agent_match"
-                    entry["reason"] = "no extension found"
+                    entry["reason"] = "no single-field agent match"
                     stats["no_agent_match"] += 1
                     print("[DEBUG] AGENT: <none> (no_agent_match)")
                     items.append(entry)
                     continue
 
-                decision_rule = "fast_agent" if not deep_agent else "fast_or_deep_agent"
-                decision_note = f"Extension via {agent_src}"
+                decision_rule = "agent_from_single_field"
+                decision_note = f"Picked {agent_ext} via {agent_src}"
                 print(f"[DEBUG] AGENT CHOSEN: {agent_ext}  (via {agent_src})")
-                # -------------------------------------------------------------------------------
+
 
                 # CUST detection
                 cust_digits, cust_source_field = find_cust_digits_anywhere(cdr_row, agent_ext, valid_exts)
