@@ -76,6 +76,12 @@ from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, date, timedelta, timezone
 from decimal import Decimal
 
+# Ensure line-buffered output so progress prints appear immediately
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
+
 # -------------------- Optional .env loader --------------------
 ENV_LOADED = False
 try:
@@ -167,6 +173,9 @@ COMPUTE_MD5 = env_bool("COMPUTE_MD5", False)
 PLAN_OUT_DIR = env_str("PLAN_OUT_DIR", "./out")
 STATE_OUT_DIR = env_str("STATE_OUT_DIR", "./out")
 
+# Skip internal ext-to-ext/local calls via .env
+SKIP_LOCAL_CALLS = env_bool("SKIP_LOCAL_CALLS", True)
+
 # Filters
 AGENT_UPLOAD_FILTER_REGEX = env_str("AGENT_UPLOAD_FILTER_REGEX", "")
 AGENT_UPLOAD_FILTER_ARRAY = [s.strip() for s in (env_str("AGENT_UPLOAD_FILTER_ARRAY", "") or "").split(",") if s.strip()]
@@ -214,17 +223,6 @@ def normalize_10_digits(number_str: Optional[str]) -> Optional[str]:
         return None
     return digits[-10:]
 
-def clean_number_keep_10_or_11(num: Optional[str]) -> Optional[str]:
-    d = digits_only(num)
-    if len(d) in (10, 11):
-        return d
-    if len(d) > 11:
-        last11 = d[-11:]
-        if last11.startswith("1"):
-            return last11
-        return d[-10:]
-    return None
-
 def normalize_filename_piece(s: str) -> str:
     return re.sub(r'[^a-zA-Z0-9_.-]', '', s or '')
 
@@ -256,7 +254,7 @@ def build_precise_s3_name(domain: str, cust_digits: Optional[str], uuid: str, ag
       <domain>_CUST_<digits or UNKNOWN>_GUID_<uuid>_AGENT_<agent or UNKNOWN>_DATETIME_<YYYY-MM-DDTHH-MM-SS><ext>
     """
     dom = normalize_filename_piece(domain)
-    cust = cust_digits if (cust_digits and cust_digits.isdigit() and len(cust_digits) in (10,11)) else "UNKNOWN"
+    cust = cust_digits if (cust_digits and cust_digits.isdigit() and len(cust_digits) == 10) else "UNKNOWN"
     agent = (agent_ext or "UNKNOWN")
     when = fmt_filename_datetime(dt)
     file_ext = ext if ext.startswith(".") else f".{ext}" if ext else ""
@@ -321,9 +319,7 @@ def extract_cust(cdr: Dict[str, Any]) -> Optional[str]:
     direction = str(cdr.get("direction") or "").lower()
     cid = str(cdr.get("caller_id_number") or "")
     dst = str(cdr.get("destination_number") or "")
-    # Match test script behavior:
-    # outbound => external is destination_number
-    # otherwise (inbound/local/internal/unknown) => external is caller_id_number
+    # outbound => external is destination_number; otherwise => caller_id_number
     external_raw = dst if direction == "outbound" else cid
     return normalize_10_digits(external_raw)
 
@@ -344,6 +340,19 @@ def extract_best_time(cdr: Dict[str, Any], fallback_iso_mtime: Optional[str]) ->
         except Exception:
             return None
     return None
+
+def is_internal_call(cdr: Dict[str, Any]) -> bool:
+    """True if ext-to-ext/internal:
+       - direction == 'local', OR
+       - both caller_id_number and destination_number look like short extensions (2–6 digits)."""
+    direction = str(cdr.get("direction") or "").lower()
+    if direction == "local":
+        return True
+    cid = digits_only(cdr.get("caller_id_number") or "")
+    dst = digits_only(cdr.get("destination_number") or "")
+    def _is_ext(x: str) -> bool:
+        return x.isdigit() and 2 <= len(x) <= 6
+    return _is_ext(cid) and _is_ext(dst)
 
 # -------------------- Duration --------------------
 def get_audio_duration(file_path: str) -> float:
@@ -370,7 +379,7 @@ def parse_date_range(s: str) -> Tuple[date, date]:
 
 def parse_args():
     ap = argparse.ArgumentParser(description="Scan → UUID CDR lookup → rename plan → S3 upload (with AGENT + CUST from exact UUID)")
-    ap.add_argument("--domain", required=True, help="PBX domain, e.g. leemyles.blueuc.com")
+    ap.add_argument("--domain", required=True, help="PBX domain, e.g. example.com")
     ap.add_argument("--dry-run", action="store_true", help="Do not upload or trigger Step Functions")
     ap.add_argument("--resume", action="store_true", help="Resume using saved state for this domain")
     ap.add_argument("--state", help="Path to state JSON (default ./out/state_<domain>.json)")
@@ -379,6 +388,7 @@ def parse_args():
                     help="Upload only the first eligible file not previously used for one-file tests; stop immediately after")
     ap.add_argument("--date-range", help="YYYY-MM-DD:YYYY-MM-DD inclusive; scan only this range; ignore resume/seed timing; does not update last_run_time_utc")
     ap.add_argument("--no-prefix", action="store_true", help="Ignore S3_KEY_PREFIX and upload to bucket root")
+    ap.add_argument("--verbose", action="store_true", help="Verbose per-file progress output")
     return ap.parse_args()
 
 def default_state_path(domain: str) -> str:
@@ -411,6 +421,7 @@ def main():
     state_path = args.state or default_state_path(domain)
     plan_path = args.plan or default_plan_path(domain)
     dry_run = args.dry_run
+    verbose = args.verbose
 
     # Load or init state
     state = load_state(state_path)
@@ -433,6 +444,7 @@ def main():
         "UUID_REGEX": UUID_REGEX,
         "AGENT_UPLOAD_FILTER_REGEX": AGENT_UPLOAD_FILTER_REGEX,
         "AGENT_UPLOAD_FILTER_ARRAY": AGENT_UPLOAD_FILTER_ARRAY,
+        "SKIP_LOCAL_CALLS": SKIP_LOCAL_CALLS,
     }
     if args.resume and "config_snapshot" in state:
         print("[INFO] --resume: using prior config snapshot")
@@ -513,7 +525,8 @@ def main():
         "mapped_agent_cust": 0,
         "uploads_done": 0,
         "uploads_skipped_unchanged": 0,
-        "uploads_skipped_agent_filter": 0
+        "uploads_skipped_agent_filter": 0,
+        "skipped_internal_calls": 0
     }
 
     items: List[Dict[str, Any]] = []
@@ -551,7 +564,8 @@ def main():
         if not os.path.isdir(folder):
             continue
 
-        print(f"[SCAN] {folder}")
+        print(f"[SCAN] {folder}", flush=True)
+        progress_since_print = 0
         for root, dirs, files in os.walk(folder):
             dirs.sort()
             files.sort()
@@ -562,6 +576,12 @@ def main():
                 if ext not in cfg["AUDIO_EXTS"]:
                     continue
                 stats["files_considered"] += 1
+                progress_since_print += 1
+                if verbose:
+                    print(f"[FILE] {fn}", flush=True)
+                elif progress_since_print >= 100:
+                    print(f"[PROGRESS] considered={stats['files_considered']} duration_ok={stats['files_duration_ok']} cdr_found={stats['cdr_found']} uploads_done={stats['uploads_done']}", flush=True)
+                    progress_since_print = 0
 
                 abs_path = os.path.abspath(os.path.join(root, fn))
                 rel_path = os.path.relpath(abs_path, cfg["FREESWITCH_RECORDING_PATH"])
@@ -581,8 +601,12 @@ def main():
                 except Exception:
                     duration = 0.0
                 if duration < float(cfg["MIN_FILE_LENGTH_SECONDS"]):
+                    if verbose:
+                        print(f"[SKIP] too_short {fn} ({duration:.2f}s < {cfg['MIN_FILE_LENGTH_SECONDS']}s)", flush=True)
                     continue
                 stats["files_duration_ok"] += 1
+                if verbose:
+                    print(f"[OKLEN] {fn} ({duration:.2f}s)", flush=True)
 
                 # Skip already uploaded
                 if args.one_file_test and abs_path in state.get("one_file_test_history", []):
@@ -608,6 +632,8 @@ def main():
 
                 # -------- Exact CDR UUID lookup
                 cdr = fetch_cdr_by_uuid(cur, uuid)
+                if verbose:
+                    print(f"[UUID] {uuid} → CDR {'HIT' if cdr else 'MISS'}", flush=True)
                 if not cdr:
                     stats["no_cdr"] += 1
                     items.append({
@@ -628,6 +654,33 @@ def main():
                     continue
 
                 stats["cdr_found"] += 1
+
+                # Skip internal ext-to-ext/local calls
+                if cfg.get("SKIP_LOCAL_CALLS", True) and is_internal_call(cdr):
+                    items.append({
+                        "uuid": uuid,
+                        "original": {
+                            "filename": fn,
+                            "absolute_path": abs_path,
+                            "relative_path": rel_path,
+                            "extension": ext,
+                            "duration_seconds": round(float(duration), 2),
+                            "bytes": os.path.getsize(abs_path),
+                            "mtime_utc": datetime.utcfromtimestamp(os.path.getmtime(abs_path)).replace(tzinfo=timezone.utc).isoformat().replace("+00:00","Z"),
+                            "year": y, "month": m, "day": d2
+                        },
+                        "cdr": {
+                            "direction": cdr.get("direction"),
+                            "caller_id_number": cdr.get("caller_id_number"),
+                            "destination_number": cdr.get("destination_number")
+                        },
+                        "status": "internal_call",
+                        "reason": "Internal extension-to-extension/local call; not uploaded."
+                    })
+                    stats["skipped_internal_calls"] += 1
+                    if verbose:
+                        print(f"[SKIP] internal {uuid} {cdr.get('caller_id_number')}→{cdr.get('destination_number')}", flush=True)
+                    continue
 
                 # Extract AGENT + CUST + datetime
                 agent_ext = extract_agent(cdr)
@@ -654,6 +707,8 @@ def main():
                             "reason": f"Agent '{agent_ext}' does not match AGENT_UPLOAD_FILTER_REGEX"
                         })
                         stats["uploads_skipped_agent_filter"] += 1
+                        if verbose:
+                            print(f"[SKIP] agent_filtered {uuid} AGENT={agent_ext}", flush=True)
                         continue
                     if cfg["AGENT_UPLOAD_FILTER_ARRAY"] and agent_ext not in cfg["AGENT_UPLOAD_FILTER_ARRAY"]:
                         items.append({
@@ -673,6 +728,8 @@ def main():
                             "reason": f"Agent '{agent_ext}' not in AGENT_UPLOAD_FILTER_ARRAY"
                         })
                         stats["uploads_skipped_agent_filter"] += 1
+                        if verbose:
+                            print(f"[SKIP] agent_filtered {uuid} AGENT={agent_ext}", flush=True)
                         continue
 
                 # Filename & proposal
@@ -740,7 +797,7 @@ def main():
                 would_upload = False
 
                 if dry_run:
-                    print(f"[DRY-RUN] Would upload -> s3://{S3_BUCKET_NAME}/{s3_key}")
+                    print(f"[DRY-RUN] Would upload -> s3://{S3_BUCKET_NAME}/{s3_key}", flush=True)
                     would_upload = True
                 else:
                     if not S3_BUCKET_NAME:
@@ -770,6 +827,8 @@ def main():
                         "cust": cust_digits or "UNKNOWN",
                         "datetime": proposed["s3_components"]["datetime_iso"],
                     })
+                    if verbose:
+                        print(f"[UPLOADED] {uuid} → s3://{S3_BUCKET_NAME}/{s3_key}", flush=True)
 
                 items.append(entry)
 
@@ -837,7 +896,7 @@ def main():
         else:
             print("[INFO] No new uploads this run; Step Functions not triggered.")
 
-    # -------- Summary (now safely inside main())
+    # -------- Summary (inside main())
     print("\n===== SUMMARY =====")
     print(json.dumps(make_json_safe(stats), indent=2))
     printable = sum(1 for it in items if it.get("status") == "ok")
