@@ -831,11 +831,12 @@ def main():
             print("[INFO] No new uploads this run; Step Functions not triggered.")
 
         # Summary
-    print("===== SUMMARY =====")
+    print("
+===== SUMMARY =====")
     print(json.dumps(make_json_safe(stats), indent=2))
     printable = sum(1 for it in items if it.get("status") == "ok")
     print(f"Files with AGENT/CUST mapping (OK): {printable}")
-    print("\n===== UUID/CUST/AGENT =====")
+print("\n===== UUID/CUST/AGENT =====")
 if uploaded_this_run:
     for u in uploaded_this_run:
         print(f"{u.get('uuid')} | CUST={u.get('cust','UNKNOWN')} | AGENT={u.get('agent','UNKNOWN')} | S3_KEY={u.get('s3_key')}")
@@ -853,5 +854,14 @@ else:
             cust = (it.get("decision") or {}).get("cust_digits_10_or_11") or "UNKNOWN"
             print(f"  UUID={uuid}  AGENT={agent}  CUST={cust}")
 
+    print("\n===== UUID/CUST/AGENT =====")
+    if uploaded_this_run:
+        for u in uploaded_this_run:
+            print(f"{u.get('uuid')} | CUST={u.get('cust','UNKNOWN')} | AGENT={u.get('agent','UNKNOWN')} | S3_KEY={u.get('s3_key')}")
+    else:
+        for it in items:
+            if it.get("status") == "ok":
+                comp = (it.get("proposed") or {}).get("s3_components") or {}
+                print(f"{comp.get('uuid')} | CUST={comp.get('cust_digits','UNKNOWN')} | AGENT={comp.get('agent','UNKNOWN')} | S3_KEY={(it.get('proposed') or {}).get('s3_upload_filename')}")
 if __name__ == "__main__":
     main()
