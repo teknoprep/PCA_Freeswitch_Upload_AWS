@@ -411,8 +411,12 @@ def load_state(path: str) -> Dict[str, Any]:
 def save_state(path: str, state: Dict[str, Any]):
     data = make_json_safe(state)
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w") as f:
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w") as f:
         json.dump(data, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, path)
 
 # -------------------- Main --------------------
 def main():
@@ -818,6 +822,7 @@ def main():
                         "s3_key": s3_key,
                         "uuid": uuid
                     }
+                    save_state(state_path, {**state, "uploaded_files": uploaded_files})
                     uploaded_this_run.append({
                         "uuid": uuid,
                         "local_path": abs_path,
@@ -835,6 +840,7 @@ def main():
                 if args.one_file_test and (did_upload or would_upload):
                     if did_upload:
                         state["one_file_test_history"].append(abs_path)
+                        save_state(state_path, state)
                     stop_scanning = True
 
     # Done DB
