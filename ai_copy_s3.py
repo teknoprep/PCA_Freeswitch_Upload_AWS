@@ -6,12 +6,12 @@ ai_copy_s3.py — end-to-end scanner → UUID CDR lookup (FusionPBX-style) → r
 (Agent + Cust restored via *exact* UUID search; no deep leg chasing; minimal bloat)
 
 Usage examples:
-  ./ai_copy_s3.py --domain leemyles.blueuc.com
-  ./ai_copy_s3.py --domain leemyles.blueuc.com --dry-run
-  ./ai_copy_s3.py --domain leemyles.blueuc.com --resume
-  ./ai_copy_s3.py --domain leemyles.blueuc.com --one-file-test
-  ./ai_copy_s3.py --domain leemyles.blueuc.com --date-range 2023-01-01:2023-01-31
-  ./ai_copy_s3.py --domain leemyles.blueuc.com --no-prefix
+  ./ai_copy_s3.py --domain example.com
+  ./ai_copy_s3.py --domain example.com --dry-run
+  ./ai_copy_s3.py --domain example.com --resume
+  ./ai_copy_s3.py --domain example.com --one-file-test
+  ./ai_copy_s3.py --domain example.com --date-range 2023-01-01:2023-01-31
+  ./ai_copy_s3.py --domain example.com --no-prefix
 
 Key behavior:
 • CDR lookup is EXACT on v_xml_cdr.xml_cdr_uuid (same as FusionPBX xml_cdr app’s UUID search).
@@ -20,9 +20,9 @@ Key behavior:
     - outbound => destination_number
     - otherwise (inbound/local/internal) => caller_id_number
   Then normalized to the last 10 digits.
-  Then normalized to a 10/11-digit string (keeps leading '1' if present). If not available, falls back to UNKNOWN.
 • Optional AGENT regex filter from .env: AGENT_UPLOAD_FILTER_REGEX (Python regex). If set and AGENT does not match, skip upload.
 • Also supports legacy AGENT_UPLOAD_FILTER_ARRAY (comma-separated allowlist). If both are set, BOTH must pass.
+• Internal ext-to-ext calls (direction=local or both numbers look like short extensions) are skipped entirely if SKIP_LOCAL_CALLS=true.
 
 CONFIGURATION (via .env or env.py or environment variables)
 
@@ -54,6 +54,7 @@ CONFIGURATION (via .env or env.py or environment variables)
   COMPUTE_MD5 (default False)
   PLAN_OUT_DIR (default ./out)
   STATE_OUT_DIR (default ./out)
+  SKIP_LOCAL_CALLS (default True)
 
   # Filters
   AGENT_UPLOAD_FILTER_REGEX (optional Python regex; e.g., "^(1?0?(?:10[1-9]|11[0-9]))$")
