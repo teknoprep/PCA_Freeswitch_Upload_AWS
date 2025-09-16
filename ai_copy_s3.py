@@ -831,8 +831,7 @@ def main():
             print("[INFO] No new uploads this run; Step Functions not triggered.")
 
         # Summary
-    print("
-===== SUMMARY =====")
+    print("===== SUMMARY =====")
     print(json.dumps(make_json_safe(stats), indent=2))
     printable = sum(1 for it in items if it.get("status") == "ok")
     print(f"Files with AGENT/CUST mapping (OK): {printable}")
