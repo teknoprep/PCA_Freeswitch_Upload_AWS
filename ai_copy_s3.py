@@ -835,7 +835,7 @@ def main():
     print(json.dumps(make_json_safe(stats), indent=2))
     printable = sum(1 for it in items if it.get("status") == "ok")
     print(f"Files with AGENT/CUST mapping (OK): {printable}")
-print("\n===== UUID/CUST/AGENT =====")
+    print("\n===== UUID/CUST/AGENT =====")
 if uploaded_this_run:
     for u in uploaded_this_run:
         print(f"{u.get('uuid')} | CUST={u.get('cust','UNKNOWN')} | AGENT={u.get('agent','UNKNOWN')} | S3_KEY={u.get('s3_key')}")
