@@ -252,31 +252,42 @@ def build_precise_s3_name(domain: str, cust_digits: Optional[str], uuid: str, ag
     return f"{dom}_CUST_{cust}_GUID_{uuid}_AGENT_{agent}_DATETIME_{when}{file_ext}"
 
 # -------------------- CDR Lookup (exact UUID match, FusionPBX-style) --------------------
-CDR_SELECT = """
-    SELECT
-        c.xml_cdr_uuid,
-        c.direction,
-        c.status,
-        c.answer_stamp,
-        c.start_stamp,
-        c.end_stamp,
-        c.caller_id_name,
-        c.caller_id_number,
-        c.destination_number,
-        c.extension_uuid,
-        e.extension,
-        e.effective_caller_id_name AS extension_name,
-        c.variable_sip_to_user,
-        c.variable_sip_from_user
-    FROM v_xml_cdr AS c
-    LEFT JOIN v_extensions AS e ON e.extension_uuid = c.extension_uuid
-    WHERE c.xml_cdr_uuid = %s
-    ORDER BY c.start_stamp DESC
-    LIMIT 1;
-"""
+def get_table_columns(cur, table: str) -> set:
+    cur.execute("""SELECT column_name FROM information_schema.columns WHERE table_schema IN ('public') AND table_name = %s""", (table,))
+    return {r[0] if not isinstance(r, dict) else r.get("column_name") for r in cur.fetchall()}
 
 def fetch_cdr_by_uuid(cur, uuid: str) -> Optional[Dict[str, Any]]:
-    cur.execute(CDR_SELECT, (uuid,))
+    cols_cdr = get_table_columns(cur, "v_xml_cdr")
+    cols_ext = get_table_columns(cur, "v_extensions")
+
+    # Base fields we rely on
+    want_cdr = [
+        "xml_cdr_uuid","direction","status","answer_stamp","start_stamp","end_stamp",
+        "caller_id_name","caller_id_number","destination_number","extension_uuid"
+    ]
+    # Optional fields if present
+    opt_cdr = ["variable_sip_to_user","variable_sip_from_user"]
+
+    cdr_fields = [f"c.{c}" for c in want_cdr if c in cols_cdr]
+    cdr_fields += [f"c.{c}" for c in opt_cdr if c in cols_cdr]
+
+    ext_fields = []
+    if "extension" in cols_ext:
+        ext_fields.append("e.extension")
+    if "effective_caller_id_name" in cols_ext:
+        ext_fields.append("e.effective_caller_id_name AS extension_name")
+
+    select_list = ",\n        ".join(cdr_fields + ext_fields)
+    sql = f"""
+        SELECT
+            {select_list}
+        FROM v_xml_cdr AS c
+        LEFT JOIN v_extensions AS e ON e.extension_uuid = c.extension_uuid
+        WHERE c.xml_cdr_uuid = %s
+        ORDER BY c.start_stamp DESC
+        LIMIT 1;
+    """
+    cur.execute(sql, (uuid,))
     row = cur.fetchone()
     return dict(row) if row else None
 
