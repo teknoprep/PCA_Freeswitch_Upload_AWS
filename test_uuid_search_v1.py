@@ -3,7 +3,9 @@
 test_uuid_search_v1.py
 
 Search FusionPBX CDRs for an exact UUID match the SAME WAY the xml_cdr app does,
-then print who answered the call.
+then print who answered the call *and* the 10-digit external number involved:
+- inbound: caller's 10-digit number
+- outbound: dialed party's 10-digit number
 
 Usage:
   python3 test_uuid_search_v1.py --uuid <UUID_STRING>
@@ -16,6 +18,7 @@ Requires:
 import argparse
 import sys
 import os
+import re
 import psycopg2
 import psycopg2.extras
 from dotenv import load_dotenv
@@ -28,11 +31,23 @@ DB_NAME = os.getenv("DB_NAME")
 DB_USER = os.getenv("DB_USER")
 DB_PASS = os.getenv("DB_PASS")
 
+def normalize_10_digits(number_str: str | None) -> str | None:
+    """Return the last 10 digits of the number, stripping non-digits.
+    If fewer than 10 digits remain, return None.
+    """
+    if not number_str:
+        return None
+    import re as _re
+    digits = _re.sub(r"\D", "", number_str)
+    if len(digits) < 10:
+        return None
+    # Use the last 10 digits to accommodate country code or prefixes
+    return digits[-10:]
+
 def get_record_by_uuid(conn, uuid_str):
     """
     Mimic FusionPBX xml_cdr 'UUID' search:
     WHERE c.xml_cdr_uuid = :xml_cdr_uuid  (exact match)
-    Ref: app/xml_cdr/xml_cdr_inc.php in FusionPBX.
     """
     sql = """
         SELECT
@@ -61,7 +76,7 @@ def get_record_by_uuid(conn, uuid_str):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Search FusionPBX CDRs by UUID (exact match) and print who answered the call."
+        description="Search FusionPBX CDRs by UUID (exact match) and print who answered + external 10-digit number."
     )
     parser.add_argument("--uuid", required=True, help="UUID to search (exact match on xml_cdr_uuid)")
     args = parser.parse_args()
@@ -88,25 +103,34 @@ def main():
         status = (row["status"] or "").lower()
         ext = row["extension"]
         ext_name = row["extension_name"]
-        direction = row["direction"]
+        direction = (row["direction"] or "").lower()
         answered = bool(row["answer_stamp"]) or status == "answered"
 
+        # Determine external party number based on direction
+        if direction == "outbound":
+            external_raw = row["destination_number"]
+        else:
+            # treat anything else (inbound, local, internal) as inbound for external number purposes
+            external_raw = row["caller_id_number"]
+        external_10 = normalize_10_digits(external_raw)
+
+        # Output
         if answered and ext:
             who = f"{ext} {ext_name}".strip()
-            print(who)
-            sys.exit(0)
-
-        if answered:
-            caller = (row["caller_id_name"] or "").strip()
-            dest = (row["destination_number"] or "").strip()
-            if direction == "inbound" and dest:
-                print(dest)
-            elif caller:
-                print(caller)
-            else:
-                print("Answered, but no answering extension found in CDR.")
+        elif answered:
+            who = (row["caller_id_name"] or "Unknown").strip()
         else:
-            print(status if status else "Unknown status")
+            who = status if status else "Unknown status"
+
+        # Print simple machine-friendly lines
+        print(f"answered_by: {who}")
+        print(f"direction: {direction or 'unknown'}")
+        if external_10:
+            print(f"external_10_digit: {external_10}")
+        else:
+            # Provide the raw in case normalization failed
+            raw_display = external_raw if external_raw else "unknown"
+            print(f"external_number_raw: {raw_display}")
     finally:
         try:
             conn.close()
